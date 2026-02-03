@@ -11,8 +11,6 @@ Snakemake entrypoint: geo-temporal clustering + reconstruction for a PyPSA netwo
 All comments are in English by request.
 """
 
-from __future__ import annotations
-
 import logging
 from pathlib import Path
 from typing import Any, Dict
@@ -62,12 +60,25 @@ def _cfg_get(cfg: Any, key: str, default: Any) -> Any:
 
 
 def main() -> None:
-    if "snakemake" not in globals():
-        raise RuntimeError("This script is intended to be run by Snakemake.")
 
     configure_logging(snakemake)
     cfg = snakemake.params.get("geotemporal", {}) if hasattr(snakemake, "params") else {}
 
+    def _smk_path(namedlist: Any, key: str, idx: int = 0) -> str:
+        """Return a path from snakemake input/output regardless of named vs positional style.
+
+        In Snakemake rules, inputs/outputs can be declared either as
+        - named entries (e.g., input: network="..."), or
+        - positional entries (e.g., input: "...").
+
+        For robustness (and to simplify debugging with mock_snakemake), we
+        support both.
+        """
+        try:
+            return str(namedlist[key])
+        except Exception:
+            return str(namedlist[idx])
+    
     hours_per_day = int(_cfg_get(_cfg_get(cfg, "features", {}), "hours_per_day", 24))
 
     exclude_substrings = tuple(_cfg_get(_cfg_get(cfg, "buses", {}), "exclude_bus_substrings", [" H2", "battery"]))
@@ -99,8 +110,10 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Load network
     # ---------------------------------------------------------------------
-    in_network = snakemake.input["network"]
-    out_network = snakemake.output["network"]
+    # Snakemake may pass a named input (input: network=...) or a positional one.
+    # Accept both to avoid brittle scripts.
+    in_network = _smk_path(snakemake.input, "network", 0)
+    out_network = _smk_path(snakemake.output, "network", 0)
 
     logger.info("Loading network: %s", in_network)
     n = pypsa.Network(in_network)
@@ -180,6 +193,14 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Spatial clustering / reconstruction via PyPSA
     # ---------------------------------------------------------------------
+    # PyPSA's default aggregation uses a strict "consense" reducer for object
+    # dtypes (e.g., the 'location' column). When we merge auxiliary buses
+    # (e.g., many "* H2" buses -> one per spatial cluster), their original
+    # 'location' strings may differ and would raise an error. For our use-case
+    # the clustered bus name is the correct coarse 'location'.
+    if "location" in n.buses.columns:
+        n.buses.loc[:, "location"] = busmap.reindex(n.buses.index).astype(str)
+
     logger.info("Reconstructing clustered network using PyPSA get_clustering_from_busmap.")
     clustering = get_clustering_from_busmap(
         n,
@@ -213,7 +234,16 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Write outputs (network + mapping CSVs)
     # ---------------------------------------------------------------------
-    outdir = Path(str(snakemake.output.get("busmap", out_network))).parent
+    # Resolve outputs robustly (named vs positional outputs).
+    out_nodes_assignment = _smk_path(snakemake.output, "nodes_assignment", 1)
+    out_days_assignment = _smk_path(snakemake.output, "days_assignment", 2)
+    out_rep_days = _smk_path(snakemake.output, "representative_days", 3)
+    out_rep_nodes = _smk_path(snakemake.output, "representative_nodes", 4)
+    out_busmap = _smk_path(snakemake.output, "busmap", 5)
+    out_linemap = _smk_path(snakemake.output, "linemap", 6)
+    out_summary = _smk_path(snakemake.output, "summary", 7)
+
+    outdir = Path(out_busmap).parent
     outdir.mkdir(parents=True, exist_ok=True)
 
     # Base nodes assignment (only base_buses)
@@ -228,7 +258,7 @@ def main() -> None:
     # Add representative bus per cluster
     rep_bus_by_cluster = {int(c): base_buses[i] for i, c in zip(rep_nodes_idx, rep_labels)}
     df_nodes["rep_bus"] = df_nodes["node_cluster"].map(rep_bus_by_cluster)
-    df_nodes.to_csv(snakemake.output["nodes_assignment"], index=False)
+    df_nodes.to_csv(out_nodes_assignment, index=False)
 
     # Representative nodes table
     df_rep_nodes = pd.DataFrame(
@@ -240,7 +270,7 @@ def main() -> None:
             "cluster_size": rep_nodes_w.astype(int),
         }
     ).sort_values("rep_node_cluster")
-    df_rep_nodes.to_csv(snakemake.output["representative_nodes"], index=False)
+    df_rep_nodes.to_csv(out_rep_nodes, index=False)
 
     # Day assignment
     df_days = pd.DataFrame(
@@ -252,15 +282,15 @@ def main() -> None:
     # Weights per rep day
     rep_weight_map = {int(d): int(w) for d, w in zip(res.rep_days, res.rep_weights)}
     df_days["rep_weight"] = df_days["rep_day_index"].map(rep_weight_map).fillna(0).astype(int)
-    df_days.to_csv(snakemake.output["days_assignment"], index=False)
+    df_days.to_csv(out_days_assignment, index=False)
 
     # Representative days table
     df_rep_days = pd.DataFrame({"rep_day_index": res.rep_days.astype(int), "rep_weight": res.rep_weights.astype(int)})
-    df_rep_days.sort_values("rep_day_index").to_csv(snakemake.output["representative_days"], index=False)
+    df_rep_days.sort_values("rep_day_index").to_csv(out_rep_days, index=False)
 
     # Busmap / Linemap from PyPSA clustering
-    busmap.to_csv(snakemake.output["busmap"])
-    clustering.linemap.to_csv(snakemake.output["linemap"])
+    busmap.to_csv(out_busmap)
+    clustering.linemap.to_csv(out_linemap)
 
     # Summary YAML-ish (simple, no dependency)
     summary = {
@@ -281,7 +311,7 @@ def main() -> None:
         "day_pca_info": res.day_pca_info,
     }
     # Write as YAML-ish for readability (no pyyaml required)
-    with open(snakemake.output["summary"], "w", encoding="utf-8") as f:
+    with open(out_summary, "w", encoding="utf-8") as f:
         for k, v in summary.items():
             f.write(f"{k}: {v}\n")
 
@@ -290,4 +320,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "snakemake" not in globals():
+        from scripts._helpers import mock_snakemake
+        snakemake = mock_snakemake(
+            "geo_temporal_cluster_network",
+            clusters="adm",
+            opts="Gt",
+            configfiles=["config/config_clustering.yaml"],
+        )
+
     main()
+

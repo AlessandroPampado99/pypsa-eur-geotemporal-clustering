@@ -7,8 +7,6 @@ This script ONLY reads mapping CSVs and creates plots. It does NOT modify networ
 All comments are in English by request.
 """
 
-from __future__ import annotations
-
 import logging
 from pathlib import Path
 
@@ -49,10 +47,17 @@ def main() -> None:
 
     configure_logging(snakemake)
 
-    nodes_fn = snakemake.input["nodes_assignment"]
-    rep_nodes_fn = snakemake.input["representative_nodes"]
+    def _smk_path(namedlist, key: str, idx: int = 0) -> str:
+        """Get a path from snakemake input/output for both named and positional declarations."""
+        try:
+            return str(namedlist[key])
+        except Exception:
+            return str(namedlist[idx])
 
-    out_png = Path(snakemake.output["nodes_map"])
+    nodes_fn = _smk_path(snakemake.input, "nodes_assignment", 0)
+    rep_nodes_fn = _smk_path(snakemake.input, "representative_nodes", 1)
+
+    out_png = Path(_smk_path(snakemake.output, "nodes_map", 0))
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(nodes_fn)

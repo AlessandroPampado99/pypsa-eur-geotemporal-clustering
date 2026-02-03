@@ -7,8 +7,6 @@ This module is intentionally self-contained and uses only public PyPSA APIs.
 All comments are in English by request.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Literal, Union
 

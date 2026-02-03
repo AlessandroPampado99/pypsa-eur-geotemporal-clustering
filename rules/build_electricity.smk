@@ -953,3 +953,49 @@ if config["electricity"]["base_network"] == "tyndp":
             mem_mb=4000,
         script:
             "../scripts/build_tyndp_network.py"
+
+# -------------------------------
+rule geo_temporal_cluster_network:
+    message:
+        "Geo-temporal clustering for {wildcards.clusters} clusters and options {wildcards.opts}"
+    params:
+        geotemporal=config_provider("clustering", "geotemporal", default={})
+    input:
+        network=resources("networks/base_s_{clusters}_elec_{opts}.nc"),
+    output:
+        network=resources("networks/base_s_{clusters}_elec_{opts}_gt.nc"),
+        nodes_assignment=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_assignment.csv"),
+        days_assignment=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/days_assignment.csv"),
+        representative_days=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/representative_days.csv"),
+        representative_nodes=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/representative_nodes.csv"),
+        busmap=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/busmap.csv"),
+        linemap=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/linemap.csv"),
+        summary=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/summary.txt"),
+    log:
+        logs("geo_temporal_cluster_network/base_s_{clusters}_elec_{opts}.log"),
+    benchmark:
+        benchmarks("geo_temporal_cluster_network/base_s_{clusters}_elec_{opts}"),
+    threads: 1
+    resources:
+        mem_mb=12000,
+    script:
+        "../scripts/geo_temporal_clustering/run.py"
+
+
+rule plot_geo_temporal_cluster_network:
+    message:
+        "Plotting geo-temporal clustering diagnostics for {wildcards.clusters} clusters and options {wildcards.opts}"
+    input:
+        nodes_assignment=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_assignment.csv"),
+        representative_nodes=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/representative_nodes.csv"),
+    output:
+        nodes_map="results/plots/geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_map.png",
+    log:
+        logs("geo_temporal_cluster_network/base_s_{clusters}_elec_{opts}_plot.log"),
+    benchmark:
+        benchmarks("geo_temporal_cluster_network/base_s_{clusters}_elec_{opts}_plot"),
+    threads: 1
+    resources:
+        mem_mb=4000,
+    script:
+        "../scripts/geo_temporal_clustering/plot.py"

@@ -2,6 +2,11 @@
 #
 # SPDX-License-Identifier: MIT
 
+def input_network_for_solve(w):
+    # Hardcoded: geotemporal reduction is activated when "Gt" appears in opts.
+    if "Gt" in str(w.opts):
+        return resources(f"networks/base_s_{w.clusters}_elec_{w.opts}_gt.nc")
+    return resources(f"networks/base_s_{w.clusters}_elec_{w.opts}.nc")
 
 rule solve_network:
     message:
@@ -14,7 +19,7 @@ rule solve_network:
         ),
         custom_extra_functionality=input_custom_extra_functionality,
     input:
-        network=resources("networks/base_s_{clusters}_elec_{opts}.nc"),
+        network=input_network_for_solve,
     output:
         network=RESULTS + "networks/base_s_{clusters}_elec_{opts}.nc",
         config=RESULTS + "configs/config.base_s_{clusters}_elec_{opts}.yaml",

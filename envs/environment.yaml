@@ -1,4 +1,4 @@
-name: pypsa-eur
+name: pypsa-eur-clustering
 channels:
 - conda-forge
 - bioconda

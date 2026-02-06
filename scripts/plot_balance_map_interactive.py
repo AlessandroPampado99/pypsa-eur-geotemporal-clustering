@@ -13,6 +13,12 @@ import pypsa
 from pypsa.plot.maps.interactive import PydeckPlotter
 from pypsa.statistics import get_transmission_carriers
 
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]  # points to /dati/pampado/pypsa-eur
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from scripts._helpers import (
     configure_logging,
     set_scenario_config,
@@ -74,11 +80,12 @@ if __name__ == "__main__":
 
         snakemake = mock_snakemake(
             "plot_balance_map_interactive",
-            clusters=50,
+            clusters='adm',
             opts="",
             sector_opts="",
             planning_horizons="2050",
-            carrier="H2",
+            carrier="AC",
+            configfiles=["all_electric/config.yaml"]
         )
 
     configure_logging(snakemake)
@@ -106,7 +113,19 @@ if __name__ == "__main__":
     pypsa.options.params.statistics.drop_zero = True
     pypsa.options.params.statistics.nice_names = False
 
-    regions = gpd.read_file(snakemake.input.regions).set_index("name")
+    regions = gpd.read_file(snakemake.input.regions)
+
+    # Merge duplicate region names (multipart geometries, islands, etc.)
+    if "name" not in regions.columns:
+        raise KeyError("Expected column 'name' in regions GeoJSON.")
+
+    # dissolve creates a single geometry per name, index becomes 'name'
+    regions = regions.dissolve(by="name")
+
+    # Safety: ensure the index is unique (should already be after dissolve)
+    if regions.index.has_duplicates:
+        regions = regions[~regions.index.duplicated(keep="first")]
+
     carrier = snakemake.wildcards.carrier
     carrier = carrier.replace("_", " ")
 
@@ -160,7 +179,7 @@ if __name__ == "__main__":
         branch_components = ["Line", "Link"]
 
     ### Prices
-    buses = n.buses.query("carrier in @carrier").index
+    buses = n.buses.query("carrier == @carrier").index
     demand = (
         n.statistics.energy_balance(
             bus_carrier=carrier, aggregate_time=False, groupby=["bus", "carrier"]
@@ -173,14 +192,23 @@ if __name__ == "__main__":
         .T
     )
 
+    # Compute weighted average marginal price per region (location).
     weights = n.snapshot_weightings.generators
-    price = (
-        weights
-        @ n.buses_t.marginal_price.reindex(buses, axis=1).rename(
-            n.buses.location, axis=1
-        )
-        / weights.sum()
-    )
+
+    mp = n.buses_t.marginal_price.reindex(buses, axis=1)
+
+    # Map bus names to locations (regions); this can create duplicate column labels.
+    mp = mp.rename(n.buses.location, axis=1)
+
+    # Aggregate duplicate locations (mean price across buses in same location).
+    if mp.columns.has_duplicates:
+        mp = mp.groupby(level=0, axis=1).mean()
+
+    price = (weights @ mp) / weights.sum()
+
+    # Safety: ensure unique index (should be after groupby)
+    if price.index.has_duplicates:
+        price = price.groupby(level=0).mean()
 
     if carrier == "co2 stored" and "CO2Limit" in n.global_constraints.index:
         co2_price = n.global_constraints.loc["CO2Limit", "mu"]

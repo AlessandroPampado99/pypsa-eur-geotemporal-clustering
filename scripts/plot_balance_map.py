@@ -24,6 +24,51 @@ from scripts.plot_power_network import load_projection
 
 SEMICIRCLE_CORRECTION_FACTOR = 2 if parse(pypsa.__version__) <= Version("0.33.2") else 1
 
+
+def _read_regions_unique(path: str) -> gpd.GeoDataFrame:
+    """Read regions GeoJSON and ensure unique index by dissolving on 'name'."""
+    regions = gpd.read_file(path)
+    if "name" not in regions.columns:
+        raise KeyError("Expected column 'name' in regions GeoJSON.")
+    regions = regions.dissolve(by="name")
+    if regions.index.has_duplicates:
+        regions = regions[~regions.index.duplicated(keep="first")]
+    return regions
+
+
+def _prepare_plot_locations(n: pypsa.Network) -> pd.Series:
+    """
+    Prepare a robust location label for each bus.
+    If location is missing/empty, use the bus name itself to avoid collapsing.
+    """
+    loc = n.buses["location"].replace("", pd.NA)
+    loc = loc.fillna(pd.Series(n.buses.index, index=n.buses.index))
+    return loc
+
+
+def _remap_bus_coordinates_to_location_bus(n: pypsa.Network, plot_loc: pd.Series) -> None:
+    """
+    Remap bus coordinates to the coordinates of the bus referenced by plot_loc,
+    but only if plot_loc matches an existing bus name. Otherwise keep original coords.
+
+    This avoids NaNs and prevents buses from collapsing to a single 'EU' point.
+    """
+    x0 = n.buses["x"].copy()
+    y0 = n.buses["y"].copy()
+
+    # Coordinates keyed by bus name (safe mapping target)
+    x_by_bus = x0.copy()
+    y_by_bus = y0.copy()
+
+    # Map each bus to location-bus coordinates when available
+    x_new = plot_loc.map(x_by_bus)
+    y_new = plot_loc.map(y_by_bus)
+
+    # Keep original coordinates when mapping failed
+    n.buses["x"] = x_new.fillna(x0)
+    n.buses["y"] = y_new.fillna(y0)
+
+
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from scripts._helpers import mock_snakemake
@@ -47,61 +92,58 @@ if __name__ == "__main__":
     pypsa.set_option("params.statistics.drop_zero", True)
     pypsa.set_option("params.statistics.nice_names", False)
 
-    regions = gpd.read_file(snakemake.input.regions).set_index("name")
+    regions = _read_regions_unique(snakemake.input.regions)
+
     config = snakemake.params.plotting
     carrier = snakemake.wildcards.carrier
     settings = snakemake.params.settings
-    carrier = carrier.replace(
-        "_", " "
-    )  # needed for slurm environment where [space] is not allowed
+    carrier = carrier.replace("_", " ")
 
-    # fill empty colors or "" with light grey
+    # Fill empty colors with light grey
     mask = n.carriers.color.isna() | n.carriers.color.eq("")
     n.carriers["color"] = n.carriers.color.mask(mask, "lightgrey")
 
-    # set EU location with location from config
+    # Set EU bus coordinates from config if present (do NOT force all buses to EU)
     eu_location = config["eu_node_location"]
-    n.buses.loc["EU", ["x", "y"]] = eu_location["x"], eu_location["y"]
+    if "EU" in n.buses.index:
+        n.buses.loc["EU", ["x", "y"]] = eu_location["x"], eu_location["y"]
 
-    # get balance map plotting parameters
+    # Plotting parameters
     boundaries = config["map"]["boundaries"]
     unit_conversion = settings["unit_conversion"]
     branch_color = settings.get("branch_color") or "darkseagreen"
 
     if carrier not in n.buses.carrier.unique():
         raise ValueError(
-            f"Carrier {carrier} is not in the network. Remove from configuration `plotting: balance_map: bus_carriers`."
+            f"Carrier {carrier} is not in the network. Remove from configuration "
+            "`plotting: balance_map: bus_carriers`."
         )
 
-    # for plotting change bus to location
-    n.buses["location"] = n.buses["location"].replace("", "EU").fillna("EU")
+    # Prepare plot locations and remap coordinates safely
+    plot_loc = _prepare_plot_locations(n)
+    n.buses["location"] = plot_loc  # keep behaviour for price grouping below
+    _remap_bus_coordinates_to_location_bus(n, plot_loc)
 
-    # set location of buses to EU if location is empty and set x and y coordinates to bus location
-    n.buses["x"] = n.buses.location.map(n.buses.x)
-    n.buses["y"] = n.buses.location.map(n.buses.y)
-
-    # bus_sizes according to energy balance of bus carrier
+    # Bus sizes from energy balance of bus carrier
     eb = n.statistics.energy_balance(bus_carrier=carrier, groupby=["bus", "carrier"])
 
-    # remove energy balance of transmission carriers which relate to losses
+    # Remove energy balance of transmission carriers which relate to losses
     transmission_carriers = get_transmission_carriers(n, bus_carrier=carrier).rename(
         {"name": "carrier"}
     )
     components = transmission_carriers.unique("component")
     carriers = transmission_carriers.unique("carrier")
 
-    # only carriers that are also in the energy balance
     carriers_in_eb = carriers[carriers.isin(eb.index.get_level_values("carrier"))]
-
     eb.loc[components] = eb.loc[components].drop(index=carriers_in_eb, level="carrier")
     eb = eb.dropna()
+
     bus_sizes = eb.groupby(level=["bus", "carrier"]).sum().div(unit_conversion)
     bus_sizes = bus_sizes.sort_values(ascending=False)
 
-    # Get colors for carriers
+    # Carrier colors
     n.carriers.update({"color": snakemake.params.plotting["tech_colors"]})
     carrier_colors = n.carriers.color.copy().replace("", "grey")
-
     colors = (
         bus_sizes.index.get_level_values("carrier")
         .unique()
@@ -109,7 +151,7 @@ if __name__ == "__main__":
         .map(carrier_colors)
     )
 
-    # line and links widths according to optimal capacity
+    # Branch widths from transmission statistics
     flow = n.statistics.transmission(groupby=False, bus_carrier=carrier).div(
         unit_conversion
     )
@@ -121,20 +163,19 @@ if __name__ == "__main__":
         )
         flow = flow[~flow_reversed_mask].subtract(flow_reversed, fill_value=0)
 
-    # if there are not lines or links for the bus carrier, use fallback for plotting
-    fallback = pd.Series()
+    fallback = pd.Series(dtype=float)
     line_widths = flow.get("Line", fallback).abs()
     link_widths = flow.get("Link", fallback).abs()
 
-    # define maximal size of buses and branch width
     bus_size_factor = settings["bus_factor"]
     branch_width_factor = settings["branch_factor"]
     flow_size_factor = settings["flow_factor"]
 
-    # get prices per region as colormap
-    buses = n.buses.query("carrier in @carrier").index
+    # Prices per region as colormap
+    buses = n.buses.query("carrier == @carrier").index
     weights = n.snapshot_weightings.generators
     prices = weights @ n.buses_t.marginal_price[buses] / weights.sum()
+
     level = "name" if PYPSA_V1 else "Bus"
     price = prices.rename(n.buses.location).groupby(level=level).mean()
 
@@ -142,7 +183,6 @@ if __name__ == "__main__":
         co2_price = n.global_constraints.loc["CO2Limit", "mu"]
         price = price - co2_price
 
-    # if only one price is available, use this price for all regions
     if price.size == 1:
         regions["price"] = price.values[0]
         shift = round(abs(price.values[0]) / 20, 0)
@@ -199,7 +239,7 @@ if __name__ == "__main__":
 
     ax.set_title(carrier)
 
-    # Add colorbar
+    # Colorbar
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
     sm = plt.cm.ScalarMappable(cmap=settings["cmap"], norm=norm)
     price_unit = settings["region_unit"]
@@ -214,7 +254,6 @@ if __name__ == "__main__":
     )
     cbr.outline.set_edgecolor("None")
 
-    # add legend
     legend_kwargs = {
         "loc": "upper left",
         "frameon": False,
@@ -225,15 +264,12 @@ if __name__ == "__main__":
     pad = 0.18
     n.carriers.loc["", "color"] = "None"
 
-    # Get lists for supply and consumption carriers
     pos_carriers = bus_sizes[bus_sizes > 0].index.unique("carrier")
     neg_carriers = bus_sizes[bus_sizes < 0].index.unique("carrier")
-
-    # Determine larger total absolute value for supply and consumption for a carrier if carrier exists as both supply and consumption
     common_carriers = pos_carriers.intersection(neg_carriers)
 
-    def get_total_abs(carrier, sign):
-        values = bus_sizes.loc[:, carrier]
+    def get_total_abs(carr, sign):
+        values = bus_sizes.loc[:, carr]
         return values[values * sign > 0].abs().sum()
 
     supp_carriers = sorted(
@@ -245,7 +281,6 @@ if __name__ == "__main__":
         | {c for c in common_carriers if get_total_abs(c, 1) < get_total_abs(c, -1)}
     )
 
-    # Add supply carriers
     add_legend_patches(
         ax,
         n.carriers.color[supp_carriers],
@@ -258,7 +293,6 @@ if __name__ == "__main__":
         },
     )
 
-    # Add consumption carriers
     add_legend_patches(
         ax,
         n.carriers.color[cons_carriers],
@@ -271,7 +305,6 @@ if __name__ == "__main__":
         },
     )
 
-    # Add bus legend
     legend_bus_sizes = settings["bus_sizes"]
     unit = settings["unit"]
     if legend_bus_sizes is not None:
@@ -283,13 +316,9 @@ if __name__ == "__main__":
             ],
             [f"{s} {unit}" for s in legend_bus_sizes],
             patch_kw={"color": "#666"},
-            legend_kw={
-                "bbox_to_anchor": (0, 1),
-                **legend_kwargs,
-            },
+            legend_kw={"bbox_to_anchor": (0, 1), **legend_kwargs},
         )
 
-    # Add branch legend
     legend_branch_sizes = settings["branch_sizes"]
     if legend_branch_sizes is not None:
         add_legend_lines(

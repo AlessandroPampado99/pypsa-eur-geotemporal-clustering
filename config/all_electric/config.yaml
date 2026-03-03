@@ -1054,7 +1054,7 @@ costs:
 clustering:
   mode: administrative
   administrative:
-    level: 2
+    level: 1
     countries: {}
   focus_weights: false
   copperplate_regions: []

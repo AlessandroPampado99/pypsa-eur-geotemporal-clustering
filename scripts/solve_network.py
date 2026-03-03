@@ -1240,6 +1240,21 @@ def extra_functionality(
         module = importlib.import_module(module_name)
         custom_extra_functionality = getattr(module, module_name)
         custom_extra_functionality(n, snapshots, snakemake)  # pylint: disable=E0601
+    
+    # --- GEO-TEMPORAL SEASONAL STORAGE (only for GT electric network) ---
+    from pathlib import Path
+
+    def is_gt_electric_run(snakemake) -> bool:
+        opts = str(getattr(snakemake.wildcards, "opts", ""))
+        in_net = str(getattr(snakemake.input, "network", ""))
+        name = Path(in_net).name.lower()
+        return ("Gt" in opts) and ("_gt" in name or "gt" in name)
+
+    if "snakemake" in globals():
+        if is_gt_electric_run(snakemake):
+            logger.info("Activating seasonal-storage extra_functionality for GT electric network.")
+            from scripts.geo_temporal_clustering.seasonal_storage import add_seasonal_storage_constraints
+            add_seasonal_storage_constraints(n, snapshots, snakemake)
 
 
 def check_objective_value(n: pypsa.Network, solving: dict) -> None:

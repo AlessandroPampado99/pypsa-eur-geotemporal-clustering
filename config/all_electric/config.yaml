@@ -39,7 +39,7 @@ scenario:
   clusters:
   - 'adm'
   opts:
-  - ""
+  - "Gt"
   sector_opts:
   - ""
   planning_horizons:

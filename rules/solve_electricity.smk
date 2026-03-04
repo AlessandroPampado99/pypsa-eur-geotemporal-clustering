@@ -17,6 +17,7 @@ def input_days_assignment_for_solve_gt(w):
     )
 
 
+ruleorder: expand_gt_optimized_network > solve_network
 ruleorder: solve_network_gt > solve_network
 
 rule solve_network:

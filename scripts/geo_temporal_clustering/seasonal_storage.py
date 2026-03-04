@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, Optional, Tuple, Dict
+from typing import List, Tuple, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,9 +12,9 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------
-# CSV parsing helpers
-# ----------------------------
+# --------------------------
+# CSV helpers (days_assignment.csv -> day_sequence)
+# --------------------------
 
 def _read_days_assignment(path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -24,13 +24,14 @@ def _read_days_assignment(path: str | Path) -> pd.DataFrame:
 
 def _infer_day_sequence(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
     """
-    Build day_sequence: for each original day (0..n_days-1), returns representative day id (rep_day_index).
-    Robust to column naming differences.
+    Returns:
+      day_sequence: np.ndarray of length n_days; entry d is rep_day_index for original day d.
+      n_days: number of original days.
+    Accepts common column names: day_index + rep_day_index.
     """
     cols = {c.lower(): c for c in df.columns}
 
-    # candidate columns
-    day_candidates = ["day", "day_index", "original_day", "day_in_year", "d"]
+    day_candidates = ["day_index", "day", "original_day", "day_in_year", "d"]
     rep_candidates = ["rep_day_index", "rep_day", "representative_day", "cluster_day", "rep", "representative"]
 
     day_col = next((cols[c] for c in day_candidates if c in cols), None)
@@ -39,16 +40,14 @@ def _infer_day_sequence(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
     if day_col is None or rep_col is None:
         raise ValueError(
             f"days_assignment.csv columns not recognized. "
-            f"Need something like day_index + rep_day_index. Got: {list(df.columns)}"
+            f"Need day_index and rep_day_index (or equivalents). Got: {list(df.columns)}"
         )
 
-    tmp = df[[day_col, rep_col]].copy()
-    tmp = tmp.sort_values(day_col)
+    tmp = df[[day_col, rep_col]].copy().sort_values(day_col)
     day_vals = tmp[day_col].to_numpy()
     rep_vals = tmp[rep_col].to_numpy()
 
-    # normalize day indexing (0-based contiguous)
-    # if day starts at 1, shift
+    # Normalize to 0-based if day indexing starts at 1
     if day_vals.min() == 1 and np.all(np.unique(day_vals) == np.arange(1, day_vals.max() + 1)):
         day_vals = day_vals - 1
 
@@ -58,257 +57,324 @@ def _infer_day_sequence(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
     return day_sequence, n_days
 
 
-# ----------------------------
-# Linopy/PyPSA model helpers
-# ----------------------------
+# --------------------------
+# Model helpers (match the toy example logic)
+# --------------------------
 
-def _drop_constraints_if_exist(n, names: Iterable[str]) -> None:
-    if not hasattr(n, "model") or n.model is None:
-        logger.warning("Network model not built yet; cannot drop constraints.")
-        return
-
-    cons = getattr(n.model, "constraints", None)
-    if cons is None:
-        logger.warning("No n.model.constraints found; skipping constraint removal.")
-        return
-
-    for nm in names:
-        if nm in cons:
-            logger.info(f"Dropping constraint group: {nm}")
-            cons.pop(nm, None)
-        else:
-            logger.debug(f"Constraint group not present (ok): {nm}")
-
-
-def _get_var(n, candidates: Iterable[str]):
+def _remove_constraints_if_exist(model, names: Iterable[str]) -> List[str]:
     """
-    Fetch a linopy variable by trying multiple keys, since naming differs across versions.
-    Returns None if not found.
+    Exactly like the toy example:
+      if cname in m.constraints: m.remove_constraints(cname)
     """
-    if not hasattr(n, "model") or n.model is None:
-        return None
-
-    vars_ = getattr(n.model, "variables", None)
-    if vars_ is None:
-        return None
-
-    for key in candidates:
-        if key in vars_:
-            return vars_[key]
-
-    # Some versions nest variables differently; try attribute access as fallback
-    for key in candidates:
+    removed = []
+    for cname in names:
         try:
-            v = vars_.get(key)
-            if v is not None:
-                return v
-        except Exception:
-            pass
-    return None
+            if cname in model.constraints:
+                model.remove_constraints(cname)
+                removed.append(cname)
+        except Exception as e:
+            logger.warning(f"Could not remove constraint '{cname}': {e}")
+    return removed
 
 
-def _add_soc_full_for_storageunits(n, snapshots, full_to_clustered: pd.Index, cyclic: bool) -> None:
+def _get_required_var(model, name: str):
+    if name not in model.variables:
+        raise KeyError(f"Expected '{name}' not found in model variables.")
+    return model.variables[name]
+
+
+def _squeeze_optional_dims(var, extras=("period", "timestep")):
     """
-    Adds soc_full_su[su, t_full] and constraints linking it to clustered p_store/p_dispatch.
+    Toy example removes optional dims period/timestep by selecting index 0.
+    Works for linopy Variables which support .dims and .isel.
     """
-    if n.storage_units.empty:
-        logger.info("No StorageUnits in network; skipping StorageUnit seasonal SOC.")
-        return
-
-    # Try typical variable keys across PyPSA versions
-    p_store = _get_var(n, ["StorageUnit-p_store", "StorageUnit-p_store_t", "p_store"])
-    p_dispatch = _get_var(n, ["StorageUnit-p_dispatch", "StorageUnit-p_dispatch_t", "p_dispatch"])
-
-    if p_store is None or p_dispatch is None:
-        logger.warning(
-            "Could not find StorageUnit p_store/p_dispatch variables in linopy model. "
-            "Skipping StorageUnit seasonal SOC constraints."
-        )
-        return
-
-    # Create full SOC variable
-    su_i = n.storage_units.index
-    T_full = len(full_to_clustered)
-
-    soc_full = n.model.add_variables(
-        lower=0,
-        name="soc_full_su",
-        coords=[("StorageUnit", su_i), ("t_full", np.arange(T_full))]
-    )
-
-    # parameters
-    su = n.storage_units
-    eta_store = su.get("efficiency_store", pd.Series(1.0, index=su_i)).reindex(su_i).fillna(1.0)
-    eta_dispatch = su.get("efficiency_dispatch", pd.Series(1.0, index=su_i)).reindex(su_i).fillna(1.0)
-
-    # initial SOC (use state_of_charge_initial if present else 0)
-    soc0 = su.get("state_of_charge_initial", pd.Series(0.0, index=su_i)).reindex(su_i).fillna(0.0)
-
-    # Map each full hour -> clustered snapshot label
-    # full_to_clustered is Index of clustered snapshots aligned with t_full
-    cl_snap = pd.Index(full_to_clustered)
-
-    # Build constraints:
-    # soc_full[t] = soc_full[t-1] + eta_store * p_store[cl] - (1/eta_dispatch) * p_dispatch[cl]
-    # Use snapshot_weightings? Here we assume hourly steps already.
-    cons = []
-
-    for t in range(T_full):
-        cl = cl_snap[t]
-        if t == 0:
-            lhs = soc_full.sel(t_full=0)
-            rhs = soc0 + eta_store * p_store.sel(snapshot=cl) - (1.0 / eta_dispatch) * p_dispatch.sel(snapshot=cl)
-        else:
-            lhs = soc_full.sel(t_full=t)
-            rhs = soc_full.sel(t_full=t - 1) + eta_store * p_store.sel(snapshot=cl) - (1.0 / eta_dispatch) * p_dispatch.sel(snapshot=cl)
-        cons.append(lhs - rhs)
-
-    n.model.add_constraints(cons, name="StorageUnit-seasonal_soc_full")
-
-    if cyclic:
-        n.model.add_constraints(
-            soc_full.sel(t_full=T_full - 1) - soc_full.sel(t_full=0),
-            name="StorageUnit-seasonal_soc_full_cyclic"
-        )
+    for extra in extras:
+        if hasattr(var, "dims") and extra in var.dims:
+            var = var.isel({extra: 0})
+    return var
 
 
-def _add_soc_full_for_stores(n, snapshots, full_to_clustered: pd.Index, cyclic: bool) -> None:
+def _find_dim(var, candidates: Iterable[str]) -> str:
     """
-    Adds soc_full_store[store, t_full] and constraints linking it to clustered Store-p.
-    This is the robust baseline. If your stores are modeled via Links, you can extend here.
+    Robust dimension detection across PyPSA/linopy versions.
+
+    In some versions, component dimensions are called 'name' (e.g. dims=('snapshot','name')),
+    not 'StorageUnit' or 'Link'. This function:
+      1) prefers the unique non-snapshot dimension if there is exactly one
+      2) otherwise tries to match by candidate names (case-insensitive)
     """
-    if n.stores.empty:
-        logger.info("No Stores in network; skipping Store seasonal SOC.")
-        return
+    if not hasattr(var, "dims"):
+        raise KeyError("Variable has no .dims; cannot infer dimension names.")
 
-    p_store = _get_var(n, ["Store-p", "Store-p_t", "p"])
-    if p_store is None:
-        logger.warning(
-            "Could not find Store-p variable in linopy model. "
-            "Skipping Store seasonal SOC constraints."
-        )
-        return
+    dims = list(var.dims)
 
-    store_i = n.stores.index
-    T_full = len(full_to_clustered)
+    # Prefer the unique non-snapshot dimension (common case: ('snapshot','name'))
+    non_snap = [d for d in dims if d.lower() not in ("snapshot", "snapshots")]
+    if len(non_snap) == 1:
+        return non_snap[0]
 
-    soc_full = n.model.add_variables(
-        lower=0,
-        name="soc_full_store",
-        coords=[("Store", store_i), ("t_full", np.arange(T_full))]
-    )
+    # Otherwise try candidates
+    cand_lower = {c.lower() for c in candidates}
+    for d in dims:
+        if d.lower() in cand_lower:
+            return d
 
-    st = n.stores
-    # PyPSA Store uses efficiency_store/dispatch sometimes; if absent assume 1
-    eta_store = st.get("efficiency_store", pd.Series(1.0, index=store_i)).reindex(store_i).fillna(1.0)
-    eta_dispatch = st.get("efficiency_dispatch", pd.Series(1.0, index=store_i)).reindex(store_i).fillna(1.0)
-    soc0 = st.get("e_initial", pd.Series(0.0, index=store_i)).reindex(store_i).fillna(0.0)
+    raise KeyError(f"Cannot find expected dim among {list(candidates)} in dims={dims}")
 
-    cl_snap = pd.Index(full_to_clustered)
 
-    cons = []
-    for t in range(T_full):
-        cl = cl_snap[t]
-        # Convention: Store-p is net dispatch (positive discharging, negative charging)
-        # energy change = -p (if p>0 discharge decreases SOC), but this depends on convention.
-        # PyPSA store energy balance typically: e_t = e_{t-1} + eta_store * (-p_negative) - (1/eta_dispatch) * p_positive
-        # We approximate by splitting sign via two nonnegative vars if present; but we likely only have one p.
-        # So use simplest: e_t = e_{t-1} - p[cl]
-        if t == 0:
-            lhs = soc_full.sel(t_full=0)
-            rhs = soc0 - p_store.sel(snapshot=cl)
-        else:
-            lhs = soc_full.sel(t_full=t)
-            rhs = soc_full.sel(t_full=t - 1) - p_store.sel(snapshot=cl)
-        cons.append(lhs - rhs)
+def _map_full_hour_to_clustered_snapshot(n_snapshots: pd.Index, rep_day_index: int, hour: int):
+    """
+    Map (rep_day_index, hour) to the snapshot label used in the clustered network.
+    - If snapshots is MultiIndex: return (rep_day_index, hour) tuple (plus any constant fillers if needed).
+    - If snapshots is DatetimeIndex: construct timestamp base + rep_day_index days + hour hours.
+    """
+    if isinstance(n_snapshots, pd.MultiIndex):
+        # Most common GT format is 2-level (rep_day, hour). If more levels exist, fill with first value.
+        if n_snapshots.nlevels == 2:
+            return (int(rep_day_index), int(hour))
 
-    n.model.add_constraints(cons, name="Store-seasonal_soc_full")
+        # Fill remaining levels with first level value (best-effort)
+        tup = [int(rep_day_index), int(hour)]
+        for lv in range(2, n_snapshots.nlevels):
+            tup.append(n_snapshots.levels[lv][0])
+        return tuple(tup)
 
-    if cyclic:
-        n.model.add_constraints(
-            soc_full.sel(t_full=T_full - 1) - soc_full.sel(t_full=0),
-            name="Store-seasonal_soc_full_cyclic"
-        )
+    if isinstance(n_snapshots, pd.DatetimeIndex):
+        year = int(n_snapshots.min().year)
+        base = pd.Timestamp(f"{year}-01-01 00:00:00")
+        return base + pd.Timedelta(days=int(rep_day_index), hours=int(hour))
 
+    # Fallback (rare): if snapshots are strings, you must adapt formatting to your case
+    return f"{int(rep_day_index)}-{int(hour)}"
+
+
+# --------------------------
+# Main entrypoint called from solve_network.py extra_functionality
+# --------------------------
 
 def add_seasonal_storage_constraints(n, snapshots, snakemake) -> None:
     """
-    Seasonal storage SOC on full chronology (hole-free) while optimizing on clustered snapshots.
+    Implements the SAME LOGIC as the toy example, but with:
+      - day_sequence read from days_assignment.csv
+      - snapshot mapping compatible with GT clustered snapshots (MultiIndex or DatetimeIndex)
 
-    Expected:
-      - snakemake.input.days_assignment points to days_assignment.csv (original day -> representative day)
-      - clustered snapshots index in n.snapshots is compatible with (rep_day_index, hour) or similar
-
-    Steps:
-      1) read day_sequence from days_assignment.csv
-      2) remove built-in SOC constraints for StorageUnit + Store
-      3) add soc_full_* variables and full chronology constraints using clustered dispatch vars
-      4) optionally cyclic soc(T)=soc(0)
+    Adds:
+      - soc_full_su(StorageUnit, t=0..T)
+      - soc_full_store(Store, t=0..T)
     """
     if not hasattr(snakemake, "input") or not hasattr(snakemake.input, "days_assignment"):
         raise ValueError("snakemake.input.days_assignment missing; cannot build seasonal-storage constraints.")
 
+    # 0) Read day_sequence (chronological mapping original day -> representative day)
     days_path = snakemake.input.days_assignment
     logger.info(f"Reading days_assignment from: {days_path}")
     df = _read_days_assignment(days_path)
     day_sequence, n_days = _infer_day_sequence(df)
 
-    # Full timeline length
-    T_full = int(24 * n_days)
+    # 1) Global timeline (no duplicate day boundaries)
+    # Same as toy: T = N_days*24, time index has T+1 points (including t=0)
+    T = int(n_days * 24)
+    t_index = pd.Index(range(T + 1), name="t")
 
-    # Determine how clustered snapshots are indexed.
-    # We build, for each full hour, the corresponding clustered snapshot label.
-    # Default assumption: clustered snapshots can be selected by (rep_day_index, hour)
-    # If not MultiIndex, try to match by constructing a string key.
-    n_snap = n.snapshots
-    is_mi = isinstance(n_snap, pd.MultiIndex)
+    # 2) Model handle
+    m = n.model
 
-    rep_days_full = np.repeat(day_sequence, 24)
-    hours_full = np.tile(np.arange(24), n_days)
+    # 3) Optionally read cyclic flag from config
+    use_year_cyclic = False
+    try:
+        use_year_cyclic = bool(
+            snakemake.config.get("geotemporal", {}).get("seasonal_storage", {}).get("cyclic", False)
+        )
+    except Exception:
+        use_year_cyclic = False
 
-    if is_mi and n_snap.nlevels >= 2:
-        # assume levels: (rep_day, hour, ...) take first two levels
-        full_to_clustered = pd.MultiIndex.from_arrays([rep_days_full, hours_full], names=n_snap.names[:2])
-        # If model uses extra levels, try to align by taking first two
-        # Selection below uses .sel(snapshot=label) where label must exist;
-        # we therefore map to an Index that matches exactly an existing key.
-        # Best effort: if snapshot index has >2 levels, we try to fill remaining with first element.
-        if n_snap.nlevels > 2:
-            fillers = []
-            for lv in range(2, n_snap.nlevels):
-                fillers.append(np.repeat(n_snap.levels[lv][0], T_full))
-            arrays = [rep_days_full, hours_full] + fillers
-            full_to_clustered = pd.MultiIndex.from_arrays(arrays, names=n_snap.names)
-    else:
-        # fallback: if snapshots are strings like "d{rep}_h{hour}" you can adapt this.
-        # Here we attempt to match by exact formatting "rep_day hour" not guaranteed.
-        full_to_clustered = pd.Index([f"{d}-{h}" for d, h in zip(rep_days_full, hours_full)], name="snapshot")
-        logger.warning(
-            "Clustered snapshots are not a MultiIndex. "
-            "Fallback mapping uses 'rep-hour' strings; you may need to adapt mapping."
+    # ------------------------------------------------------------------
+    # 1) STORAGEUNITS: remove built-in SOC constraints and impose expanded SOC
+    # ------------------------------------------------------------------
+    if not n.storage_units.empty:
+        removed = _remove_constraints_if_exist(
+            m,
+            [
+                "StorageUnit-energy_balance",
+                "StorageUnit-fix-state_of_charge-lower",
+                "StorageUnit-fix-state_of_charge-upper",
+            ],
+        )
+        logger.info(f"Removed StorageUnit SOC constraints: {removed if removed else '(none found)'}")
+
+        # get variables (same names as toy)
+        p_store = _get_required_var(m, "StorageUnit-p_store")
+        p_disp = _get_required_var(m, "StorageUnit-p_dispatch")
+
+        p_store = _squeeze_optional_dims(p_store)
+        p_disp = _squeeze_optional_dims(p_disp)
+
+        su_dim = _find_dim(p_store, ["StorageUnit", "storageunit", "storage_units", "name"])
+        su_names = list(n.storage_units.index)
+
+        # Bounds from p_nom*max_hours like toy
+        Emax = (n.storage_units.p_nom * n.storage_units.max_hours).astype(float).reindex(su_names)
+        Emax = Emax.fillna(1e9)
+
+        # Create expanded SOC variable (lower=0, upper=Emax) across t=0..T
+        # In linopy you can pass scalars; we keep it simple (like toy) by using lower=0 and upper via constraints.
+        soc_full_su = m.add_variables(
+            lower=0,
+            name="soc_full_su",
+            coords=[("StorageUnit", su_names), ("t", t_index)],
         )
 
-    # Remove built-in SOC constraints
-    _drop_constraints_if_exist(n, [
-        "StorageUnit-energy_balance",
-        "StorageUnit-fix-state_of_charge-lower",
-        "StorageUnit-fix-state_of_charge-upper",
-        "Store-energy_balance",
-        "Store-fix-e-lower",
-        "Store-fix-e-upper",
-    ])
+        # Upper bound constraints (soc <= Emax) for each su and time
+        for su in su_names:
+            m.add_constraints(
+                soc_full_su.sel(StorageUnit=su, t=t_index) <= float(Emax.loc[su]),
+                name=f"soc_full_su_upper_{su}",
+            )
 
-    # cyclic flag from config (optional)
-    cyclic = False
-    try:
-        cyclic = bool(snakemake.config.get("geotemporal", {}).get("seasonal_storage", {}).get("cyclic", False))
-    except Exception:
-        cyclic = False
+        # Initial SOC constraints (toy logic: if <=1 treat as fraction else absolute)
+        for su in su_names:
+            init = np.nan
+            if "state_of_charge_initial" in n.storage_units.columns:
+                init = n.storage_units.at[su, "state_of_charge_initial"]
+            if pd.isna(init):
+                init_val = 0.5 * float(Emax.loc[su])
+            else:
+                init = float(init)
+                init_val = init * float(Emax.loc[su]) if init <= 1.0 else init
 
-    logger.info(f"Adding seasonal SOC full chronology constraints (T_full={T_full}, cyclic={cyclic})")
+            m.add_constraints(
+                soc_full_su.sel(StorageUnit=su, t=0) == init_val,
+                name=f"soc_full_su_init_{su}",
+            )
 
-    # Add constraints for StorageUnits and Stores
-    _add_soc_full_for_storageunits(n, snapshots, full_to_clustered=full_to_clustered, cyclic=cyclic)
-    _add_soc_full_for_stores(n, snapshots, full_to_clustered=full_to_clustered, cyclic=cyclic)
+        # Recursion constraints across full horizon
+        snap_index = n.snapshots
+        for su in su_names:
+            eta_ch = float(n.storage_units.at[su, "efficiency_store"]) if "efficiency_store" in n.storage_units.columns else 1.0
+            eta_dis = float(n.storage_units.at[su, "efficiency_dispatch"]) if "efficiency_dispatch" in n.storage_units.columns else 1.0
 
-    logger.info("Seasonal storage constraints added.")
+            p_store_su = p_store.sel({su_dim: su})
+            p_disp_su = p_disp.sel({su_dim: su})
+
+            for k in range(T):
+                d = k // 24
+                hh = k % 24
+                rep_day = int(day_sequence[d])
+                rep = _map_full_hour_to_clustered_snapshot(snap_index, rep_day, hh)
+
+                m.add_constraints(
+                    soc_full_su.sel(StorageUnit=su, t=k + 1)
+                    == soc_full_su.sel(StorageUnit=su, t=k)
+                    + eta_ch * p_store_su.sel(snapshot=rep)
+                    - (1.0 / eta_dis) * p_disp_su.sel(snapshot=rep),
+                    name=f"soc_full_su_balance_{su}_{k}",
+                )
+
+            if use_year_cyclic:
+                m.add_constraints(
+                    soc_full_su.sel(StorageUnit=su, t=T) == soc_full_su.sel(StorageUnit=su, t=0),
+                    name=f"soc_full_su_cyclic_{su}",
+                )
+    else:
+        logger.info("No StorageUnits: skipping StorageUnit expanded SOC.")
+
+    # ------------------------------------------------------------------
+    # 2) STORES (+ LINKS): remove Store energy balance and impose expanded SOC
+    # ------------------------------------------------------------------
+    if not n.stores.empty:
+        removed = _remove_constraints_if_exist(
+            m,
+            [
+                "Store-energy_balance",
+                "Store-fix-e-lower",
+                "Store-fix-e-upper",
+            ],
+        )
+        logger.info(f"Removed Store SOC constraints: {removed if removed else '(none found)'}")
+
+        # Link power variable (same as toy)
+        link_p = _get_required_var(m, "Link-p")
+        link_p = _squeeze_optional_dims(link_p)
+
+        link_dim = _find_dim(link_p, ["Link", "link", "links", "name"])
+        store_names = list(n.stores.index)
+
+        # Expanded Store SOC variable
+        soc_full_store = m.add_variables(
+            lower=0,
+            name="soc_full_store",
+            coords=[("Store", store_names), ("t", t_index)],
+        )
+
+        # Upper bounds e_nom
+        for s in store_names:
+            e_nom = n.stores.at[s, "e_nom"] if "e_nom" in n.stores.columns else np.nan
+            e_max = float(e_nom) if pd.notna(e_nom) else 1e9
+            m.add_constraints(
+                soc_full_store.sel(Store=s, t=t_index) <= e_max,
+                name=f"soc_full_store_upper_{s}",
+            )
+
+        # Build mapping store -> (charge_links, discharge_links) based on store bus (same as toy)
+        snap_index = n.snapshots
+        for s in store_names:
+            sbus = n.stores.at[s, "bus"]
+
+            charge_links = n.links.index[n.links.bus1 == sbus].tolist()
+            discharge_links = n.links.index[n.links.bus0 == sbus].tolist()
+
+            charge_links = [l for l in charge_links if n.links.at[l, "bus0"] != sbus]
+            discharge_links = [l for l in discharge_links if n.links.at[l, "bus1"] != sbus]
+
+            if len(charge_links) == 0 and len(discharge_links) == 0:
+                logger.info(f"Store '{s}' has no charge/discharge links detected -> skipping.")
+                continue
+
+            # Initial energy
+            e_init = n.stores.at[s, "e_initial"] if "e_initial" in n.stores.columns else np.nan
+            if pd.isna(e_init):
+                e_nom = n.stores.at[s, "e_nom"] if "e_nom" in n.stores.columns else np.nan
+                e_init_val = 0.5 * float(e_nom) if pd.notna(e_nom) else 0.0
+            else:
+                e_init_val = float(e_init)
+
+            m.add_constraints(
+                soc_full_store.sel(Store=s, t=0) == e_init_val,
+                name=f"soc_full_store_init_{s}",
+            )
+
+            # Recursion
+            for k in range(T):
+                d = k // 24
+                hh = k % 24
+                rep_day = int(day_sequence[d])
+                rep = _map_full_hour_to_clustered_snapshot(snap_index, rep_day, hh)
+
+                # charging: + eff * p_link
+                expr_charge = 0
+                for l in charge_links:
+                    eff = float(n.links.at[l, "efficiency"]) if "efficiency" in n.links.columns else 1.0
+                    expr_charge = expr_charge + eff * link_p.sel({link_dim: l}).sel(snapshot=rep)
+
+                # discharging: - p_link (power leaving store bus)
+                expr_dis = 0
+                for l in discharge_links:
+                    expr_dis = expr_dis + link_p.sel({link_dim: l}).sel(snapshot=rep)
+
+                m.add_constraints(
+                    soc_full_store.sel(Store=s, t=k + 1)
+                    == soc_full_store.sel(Store=s, t=k)
+                    + expr_charge
+                    - expr_dis,
+                    name=f"soc_full_store_balance_{s}_{k}",
+                )
+
+            if use_year_cyclic:
+                m.add_constraints(
+                    soc_full_store.sel(Store=s, t=T) == soc_full_store.sel(Store=s, t=0),
+                    name=f"soc_full_store_cyclic_{s}",
+                )
+    else:
+        logger.info("No Stores: skipping Store expanded SOC.")
+
+    logger.info("Seasonal storage constraints (toy-style) added successfully.")

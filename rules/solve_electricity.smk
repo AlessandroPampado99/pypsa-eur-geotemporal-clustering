@@ -3,24 +3,21 @@
 # SPDX-License-Identifier: MIT
 
 def input_network_for_solve(w):
-    # Hardcoded: geotemporal reduction is activated when "Gt" appears in opts.
-    if "Gt" in str(w.opts):
-        return resources(f"networks/base_s_{w.clusters}_elec_{w.opts}_gt.nc")
+    # Base network prepared in resources/
     return resources(f"networks/base_s_{w.clusters}_elec_{w.opts}.nc")
 
-def output_network_for_solve(w):
-    if "Gt" in str(w.opts):
-        return RESULTS + f"networks/base_s_{w.clusters}_elec_{w.opts}_gt.nc"
-    return RESULTS + f"networks/base_s_{w.clusters}_elec_{w.opts}.nc"
+def input_network_for_solve_gt(w):
+    # Clustered network produced by geo_temporal_cluster_network (resources/)
+    return resources(f"networks/base_s_{w.clusters}_elec_{w.opts}_gt.nc")
 
-def days_assignment_for_solve(w):
-    """
-    For GT runs return the real mapping file. For non-GT return a dummy path
-    (won't be used because seasonal storage extra_functionality is only enabled for GT).
-    """
-    if "Gt" in str(w.opts):
-        return RESULTS + f"geotemporal_clustering/base_s_{w.clusters}_elec_{w.opts}/days_assignment.csv"
-    return RESULTS + "geotemporal_clustering/_dummy_days_assignment.csv"
+def input_days_assignment_for_solve_gt(w):
+    # Mapping CSV produced by geo_temporal_cluster_network (resources/)
+    return resources(
+        f"geotemporal_clustering/base_s_{w.clusters}_elec_{w.opts}/days_assignment.csv"
+    )
+
+
+ruleorder: solve_network_gt > solve_network
 
 rule solve_network:
     message:
@@ -33,18 +30,9 @@ rule solve_network:
         ),
         custom_extra_functionality=input_custom_extra_functionality,
     input:
-        # If GT: solve the clustered network produced by geo_temporal_cluster_network.
-        # Else: solve the standard network.
-        network=lambda w: (
-            RESULTS + f"networks/base_s_{w.clusters}_elec_{w.opts}_gt.nc"
-            if "Gt" in str(w.opts)
-            else input_network_for_solve(w)
-        ),
-        # Needed only for GT seasonal storage, but always provided (dummy for non-GT).
-        days_assignment=days_assignment_for_solve,
+        network=input_network_for_solve,
     output:
-        # IMPORTANT: for GT, output must remain *_gt.nc (optimized clustered net)
-        network=output_network_for_solve,
+        network=RESULTS + "networks/base_s_{clusters}_elec_{opts}.nc",
         config=RESULTS + "configs/config.base_s_{clusters}_elec_{opts}.yaml",
     log:
         solver=normpath(
@@ -63,16 +51,57 @@ rule solve_network:
     script:
         "../scripts/solve_network.py"
 
+
+rule solve_network_gt:
+    wildcard_constraints:
+        opts=r".*Gt.*"  # opts that DO contain 'Gt'
+    message:
+        "Solving electricity network optimization (GT) for {wildcards.clusters} clusters and {wildcards.opts} electric options"
+    params:
+        solving=config_provider("solving"),
+        foresight=config_provider("foresight"),
+        co2_sequestration_potential=config_provider(
+            "sector", "co2_sequestration_potential", default=200
+        ),
+        custom_extra_functionality=input_custom_extra_functionality,
+    input:
+        # produced by geo_temporal_cluster_network
+        network=input_network_for_solve_gt,
+        days_assignment=input_days_assignment_for_solve_gt,
+    output:
+        # optimized clustered network (RESULTS)
+        network=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt.nc",
+        config=RESULTS + "configs/config.base_s_{clusters}_elec_{opts}.yaml",
+    log:
+        solver=normpath(
+            RESULTS + "logs/solve_network/base_s_{clusters}_elec_{opts}_gt_solver.log"
+        ),
+        memory=RESULTS + "logs/solve_network/base_s_{clusters}_elec_{opts}_gt_memory.log",
+        python=RESULTS + "logs/solve_network/base_s_{clusters}_elec_{opts}_gt_python.log",
+    benchmark:
+        (RESULTS + "benchmarks/solve_network/base_s_{clusters}_elec_{opts}_gt")
+    threads: solver_threads
+    resources:
+        mem_mb=memory,
+        runtime=config_provider("solving", "runtime", default="6h"),
+    shadow:
+        shadow_config
+    script:
+        "../scripts/solve_network.py"
+
+
 rule expand_gt_optimized_network:
+    wildcard_constraints:
+        opts=r".*Gt.*"
     message:
         "Expanding optimized GT network back to full time series for {wildcards.clusters} {wildcards.opts}"
     input:
-        # This will be *_gt.nc only when opts contains 'Gt'
-        network_gt=output_network_for_solve,
-        # Real CSV for GT, dummy for non-GT (but rule will only run if needed)
-        days_assignment=days_assignment_for_solve,
+        # optimized clustered network from RESULTS
+        network_gt=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt.nc",
+        # mapping from resources (created by geo_temporal_cluster_network)
+        days_assignment=input_days_assignment_for_solve_gt,
     output:
-        # Always the standard network name (used by postprocess rules)
+        # standard name in RESULTS, used by postprocess and operations
         network=RESULTS + "networks/base_s_{clusters}_elec_{opts}.nc"
     log:
         RESULTS + "logs/geo_temporal_clustering/expand_gt_{clusters}_{opts}.log"

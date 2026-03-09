@@ -55,22 +55,21 @@ rule solve_network:
 
 rule solve_network_gt:
     wildcard_constraints:
-        opts=r".*Gt.*"  # opts that DO contain 'Gt'
+        opts=r".*Gt.*"
     message:
         "Solving electricity network optimization (GT) for {wildcards.clusters} clusters and {wildcards.opts} electric options"
     params:
         solving=config_provider("solving"),
         foresight=config_provider("foresight"),
+        geotemporal=config_provider("clustering","geotemporal"),
         co2_sequestration_potential=config_provider(
             "sector", "co2_sequestration_potential", default=200
         ),
         custom_extra_functionality=input_custom_extra_functionality,
     input:
-        # produced by geo_temporal_cluster_network
         network=input_network_for_solve_gt,
         days_assignment=input_days_assignment_for_solve_gt,
     output:
-        # optimized clustered network (RESULTS)
         network=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt.nc",
         config=RESULTS + "configs/config.base_s_{clusters}_elec_{opts}.yaml",
     log:
@@ -80,7 +79,7 @@ rule solve_network_gt:
         memory=RESULTS + "logs/solve_network/base_s_{clusters}_elec_{opts}_gt_memory.log",
         python=RESULTS + "logs/solve_network/base_s_{clusters}_elec_{opts}_gt_python.log",
     benchmark:
-        (RESULTS + "benchmarks/solve_network/base_s_{clusters}_elec_{opts}_gt")
+        RESULTS + "benchmarks/solve_network/base_s_{clusters}_elec_{opts}_gt"
     threads: solver_threads
     resources:
         mem_mb=memory,

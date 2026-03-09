@@ -1083,6 +1083,8 @@ clustering:
     resolution_elec: 1H
     resolution_sector: false
   geotemporal:
+    seasonal_storage:
+      cyclic: true
     # Activated automatically when "Gt" is present in the {opts} wildcard.
     # No explicit enable/disable flag is provided by design.
     buses:

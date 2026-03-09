@@ -96,12 +96,12 @@ rule expand_gt_optimized_network:
     message:
         "Expanding optimized GT network back to full time series for {wildcards.clusters} {wildcards.opts}"
     input:
-        # optimized clustered network from RESULTS
         network_gt=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt.nc",
-        # mapping from resources (created by geo_temporal_cluster_network)
         days_assignment=input_days_assignment_for_solve_gt,
+        full_timeline=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt_full_timeline.csv",
+        storage_units_t_full_soc=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt_storage_units_t_full_soc.csv",
+        stores_t_full_e=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt_stores_t_full_e.csv",
     output:
-        # standard name in RESULTS, used by postprocess and operations
         network=RESULTS + "networks/base_s_{clusters}_elec_{opts}.nc"
     log:
         RESULTS + "logs/geo_temporal_clustering/expand_gt_{clusters}_{opts}.log"

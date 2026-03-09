@@ -1569,7 +1569,9 @@ if __name__ == "__main__":
 
     # Runtime GT seasonal-storage parameters
     geotemporal_cfg = getattr(snakemake.params, "geotemporal", {}) or {}
-    geotemporal_cfg['days_assignment'] = str(snakemake.input.days_assignment)
+
+    if geotemporal_cfg:
+        geotemporal_cfg["days_assignment"] = str(snakemake.input.days_assignment)
 
     # Prepare network (settings before solving)
     prepare_network(

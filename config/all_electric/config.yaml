@@ -20,7 +20,7 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "all_electric"
+  prefix: "prova_mapping_noregioni"
   name: "prova"
   scenarios:
     enable: false
@@ -37,9 +37,9 @@ foresight: overnight
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#scenario
 scenario:
   clusters:
-  - 'adm'
+  - 25
   opts:
-  - "Gt"
+  - ""
   sector_opts:
   - ""
   planning_horizons:

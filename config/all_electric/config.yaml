@@ -1052,7 +1052,7 @@ costs:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#clustering
 clustering:
-  mode: administrative
+  mode: busmap
   administrative:
     level: 1
     countries: {}

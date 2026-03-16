@@ -127,27 +127,24 @@ def _expand_time_series_tables(
 ) -> None:
     """
     Expand all component time series tables indexed by original clustered snapshots.
+
+    Important:
+    - first store copies of the clustered time series
+    - then change n.snapshots
+    - then write back the expanded tables
     """
-    # Set full snapshots first
-    n.set_snapshots(full_snapshots)
+    # -------------------------------------------------------------------------
+    # 1) Store copies of all original clustered pnl tables BEFORE set_snapshots
+    # -------------------------------------------------------------------------
+    original_pnl = {}
 
-    # Uniform weights on the reconstructed full chronology
-    if hasattr(n, "snapshot_weightings") and isinstance(n.snapshot_weightings, pd.DataFrame):
-        n.snapshot_weightings = pd.DataFrame(
-            1.0, index=full_snapshots, columns=n.snapshot_weightings.columns
-        )
-    else:
-        n.snapshot_weightings = pd.DataFrame(
-            1.0,
-            index=full_snapshots,
-            columns=["objective", "stores", "generators"],
-        )
-
-    # Expand all *_t tables
     for c in n.iterate_components(n.components.keys()):
         pnl = c.pnl
         if pnl is None:
             continue
+
+        comp_name = c.name
+        original_pnl[comp_name] = {}
 
         for attr, df in pnl.items():
             if df is None or not isinstance(df, (pd.DataFrame, pd.Series)):
@@ -155,11 +152,42 @@ def _expand_time_series_tables(
 
             try:
                 if df.index.equals(original_snapshots):
-                    expanded = df.reindex(map_full_to_clustered).copy()
-                    expanded.index = full_snapshots
-                    pnl[attr] = expanded
+                    original_pnl[comp_name][attr] = df.copy()
             except Exception:
                 continue
+
+    # Also store original snapshot_weightings columns
+    if hasattr(n, "snapshot_weightings") and isinstance(n.snapshot_weightings, pd.DataFrame):
+        weighting_cols = list(n.snapshot_weightings.columns)
+    else:
+        weighting_cols = ["objective", "stores", "generators"]
+
+    # -------------------------------------------------------------------------
+    # 2) Change snapshots only AFTER saving the clustered data
+    # -------------------------------------------------------------------------
+    n.set_snapshots(full_snapshots)
+
+    # Uniform weights on the reconstructed chronology
+    n.snapshot_weightings = pd.DataFrame(
+        1.0, index=full_snapshots, columns=weighting_cols
+    )
+
+    # -------------------------------------------------------------------------
+    # 3) Write back expanded time series
+    # -------------------------------------------------------------------------
+    for c in n.iterate_components(n.components.keys()):
+        pnl = c.pnl
+        if pnl is None:
+            continue
+
+        comp_name = c.name
+        if comp_name not in original_pnl:
+            continue
+
+        for attr, df in original_pnl[comp_name].items():
+            expanded = df.reindex(map_full_to_clustered).copy()
+            expanded.index = full_snapshots
+            pnl[attr] = expanded
 
 
 # =============================================================================
@@ -295,6 +323,12 @@ def main():
 
     full_snapshots = _build_full_snapshots_like_clustered(original_snapshots, day_sequence)
     map_full_to_clustered = _build_full_to_clustered_map(original_snapshots, day_sequence)
+    missing = map_full_to_clustered.difference(original_snapshots)
+    if len(missing) > 0:
+        raise KeyError(
+            f"Some mapped clustered snapshots are missing from the optimized GT network. "
+            f"First missing: {list(missing[:10])}"
+    )
 
     if len(full_timeline) != len(full_snapshots) + 1:
         logger.warning(

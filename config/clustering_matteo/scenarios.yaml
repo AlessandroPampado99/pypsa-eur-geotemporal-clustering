@@ -11,18 +11,42 @@
 #   electricity:
 #       renewable_carriers: [wind, solar] # override the list of renewable carriers
 
-normal:
-  electricity:
-    renewable_carriers:
-    - solar
-    - onwind
-    - offwind-ac
-    - offwind-dc
-    - hydro
+gt-0.50-0.30-0.30:
+  clustering:
+    geotemporal:
+      reducer:
+        lambda_ts: 0.50
+        node_threshold: 0.30
+        day_threshold: 0.30
+        pca_days:
+          enable: false
 
-no-offwind:
-  electricity:
-    renewable_carriers:
-    - solar
-    - onwind
-    - hydro
+gt-0.75-0.28-0.22-True:
+  clustering:
+    geotemporal:
+      reducer:
+        lambda_ts: 0.75
+        node_threshold: 0.28
+        day_threshold: 0.22
+        pca_days:
+          enable: true
+
+gt-0.25-0.22-0.38:
+  clustering:
+    geotemporal:
+      reducer:
+        lambda_ts: 0.25
+        node_threshold: 0.22
+        day_threshold: 0.38
+        pca_days:
+          enable: false
+
+gt-0.50-0.40-0.40-True:
+  clustering:
+    geotemporal:
+      reducer:
+        lambda_ts: 0.50
+        node_threshold: 0.40
+        day_threshold: 0.40
+        pca_days:
+          enable: true

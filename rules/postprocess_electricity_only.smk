@@ -168,6 +168,36 @@ if config["foresight"] != "perfect":
             "../scripts/plot_balance_map.py"
 
 
+    # if config["scenario"]["opts"] == "Gt":
+    rule plot_balance_map_elec_only_gt:
+        message:
+            "Plotting ELECTRIC-ONLY GT balance map for carrier={wildcards.carrier}"
+        params:
+            plotting=config_provider("plotting"),
+            settings=lambda w: config_provider("plotting", "balance_map", w.carrier),
+        input:
+            network=electric_solved_network,
+            regions=resources("regions_onshore_base_s_{clusters}.geojson"),
+            busmap=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/busmap.csv"),
+            nodes_assignment=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_assignment.csv"),
+        output:
+            RESULTS
+            + "maps/static_gt/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}-balance_map_{carrier}.pdf",
+        threads: 1
+        resources:
+            mem_mb=8000,
+        log:
+            RESULTS
+            + "logs/plot_balance_map_elec_only_gt/"
+            + "base_s_{clusters}_elec_{opts}_{sector_opts}_{planning_horizons}_{carrier}.log",
+        benchmark:
+            RESULTS
+            + "benchmarks/plot_balance_map_elec_only_gt/"
+            + "base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_{carrier}",
+        script:
+            "../scripts/plot_balance_map_gt.py"
+
+
     rule plot_balance_map_interactive_elec_only:
         params:
             settings=lambda w: config_provider(

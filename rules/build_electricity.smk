@@ -1000,3 +1000,12 @@ rule plot_geo_temporal_cluster_network:
         mem_mb=4000,
     script:
         "../scripts/geo_temporal_clustering/plot.py"
+
+rule plot_geo_temporal_cluster_networks:
+    message:
+        "Collecting geo-temporal clustering diagnostic plots"
+    input:
+        expand(
+            resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_map.png"),
+            **config["scenario"],
+        )

@@ -988,8 +988,9 @@ rule plot_geo_temporal_cluster_network:
     input:
         nodes_assignment=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_assignment.csv"),
         representative_nodes=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/representative_nodes.csv"),
+        regions=resources("regions_onshore_base_s_{clusters}.geojson"),
     output:
-        nodes_map="results/plots/geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_map.png",
+        nodes_map=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_map.png"),
     log:
         logs("geo_temporal_cluster_network/base_s_{clusters}_elec_{opts}_plot.log"),
     benchmark:

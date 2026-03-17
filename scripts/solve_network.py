@@ -25,7 +25,6 @@ Additionally, some extra constraints specified in :mod:`solve_network` are added
     the workflow for all scenarios in the configuration file (``scenario:``)
     based on the rule :mod:`solve_network`.
 """
-
 import importlib
 import logging
 import os
@@ -33,6 +32,12 @@ import re
 import sys
 from functools import partial
 from typing import Any
+
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]  # points to /dati/pampado/pypsa-eur
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import linopy
 import numpy as np
@@ -1240,7 +1245,136 @@ def extra_functionality(
         module = importlib.import_module(module_name)
         custom_extra_functionality = getattr(module, module_name)
         custom_extra_functionality(n, snapshots, snakemake)  # pylint: disable=E0601
+    
+    # --- GEO-TEMPORAL SEASONAL STORAGE (only for GT runs) ---
+    geotemporal_cfg = getattr(n, "params", {}).get("geotemporal", {}) or {}
+    seasonal_storage_cfg = geotemporal_cfg.get("seasonal_storage", {}) or {}
 
+    opts = config['scenario']['opts']
+    is_gt_run = "Gt" in opts
+
+    if is_gt_run:
+        days_assignment_path = geotemporal_cfg['days_assignment']
+        if not days_assignment_path:
+            raise ValueError(
+                "GT seasonal storage requires 'days_assignment' in n.params."
+            )
+
+        cyclic = bool(seasonal_storage_cfg.get("cyclic", False))
+
+        logger.info(
+            "Activating seasonal-storage extra_functionality for GT run "
+            "(cyclic=%s).",
+            cyclic,
+        )
+
+        from scripts.geo_temporal_clustering.seasonal_storage import (
+            add_seasonal_storage_constraints,
+        )
+
+        add_seasonal_storage_constraints(
+            n=n,
+            snapshots=snapshots,
+            days_assignment_path=days_assignment_path,
+            cyclic=cyclic,
+        )
+
+def _extract_model_variable_to_dataframe(model, var_name: str) -> pd.DataFrame:
+    """
+    Extract a solved linopy variable to a pandas DataFrame.
+    """
+    if var_name not in model.variables:
+        raise KeyError(f"Variable '{var_name}' not found in model.variables.")
+
+    var = model.variables[var_name]
+    sol = getattr(var, "solution", None)
+
+    if sol is None:
+        raise ValueError(
+            f"Variable '{var_name}' has no solution attached. "
+            "Make sure the model was solved successfully."
+        )
+
+    out = sol.to_pandas()
+
+    if isinstance(out, pd.Series):
+        out = out.to_frame(name=var_name)
+
+    return out
+
+
+def _attach_seasonal_storage_results(n: pypsa.Network) -> None:
+    """
+    Attach full-length seasonal-storage results to the network after solve.
+    """
+    meta = getattr(n, "_seasonal_storage_meta", None)
+    if not meta:
+        logger.info("No seasonal storage metadata found on network. Skipping attachment.")
+        return
+
+    su_var_name = meta.get("storageunit_var_name", "soc_full_su")
+    store_var_name = meta.get("store_var_name", "soc_full_store")
+
+    # Build full timeline metadata
+    day_sequence = np.asarray(meta["day_sequence"], dtype=int)
+    rows = []
+    t = 0
+    for day, rep_day in enumerate(day_sequence):
+        for hour in range(24):
+            rows.append(
+                {
+                    "t": t,
+                    "day": int(day),
+                    "hour": int(hour),
+                    "rep_day": int(rep_day),
+                }
+            )
+            t += 1
+
+    # final state
+    rows.append(
+        {
+            "t": t,
+            "day": int(len(day_sequence)),
+            "hour": 0,
+            "rep_day": np.nan,
+        }
+    )
+
+    n.full_timeline = pd.DataFrame(rows).set_index("t")
+
+    # StorageUnit full SOC
+    if su_var_name in n.model.variables:
+        df_su = _extract_model_variable_to_dataframe(n.model, su_var_name)
+
+        # Normalize orientation: want index=t, columns=StorageUnit
+        if df_su.index.name == "StorageUnit" or (
+            hasattr(df_su.index, "names") and "StorageUnit" in list(df_su.index.names)
+        ):
+            df_su = df_su.T
+
+        df_su.index.name = "t"
+        n.storage_units_t_full_soc = df_su
+        logger.info(
+            "Attached full seasonal StorageUnit SOC with shape %s",
+            n.storage_units_t_full_soc.shape,
+        )
+
+    # Store full SOC / energy
+    if store_var_name in n.model.variables:
+        df_store = _extract_model_variable_to_dataframe(n.model, store_var_name)
+
+        if df_store.index.name == "Store" or (
+            hasattr(df_store.index, "names") and "Store" in list(df_store.index.names)
+        ):
+            df_store = df_store.T
+
+        df_store.index.name = "t"
+        n.stores_t_full_e = df_store
+        logger.info(
+            "Attached full seasonal Store energy with shape %s",
+            n.stores_t_full_e.shape,
+        )
 
 def check_objective_value(n: pypsa.Network, solving: dict) -> None:
     """
@@ -1413,12 +1547,12 @@ if __name__ == "__main__":
         from scripts._helpers import mock_snakemake
 
         snakemake = mock_snakemake(
-            "solve_sector_network",
-            opts="",
-            clusters="5",
-            configfiles="config/test/config.overnight.yaml",
+            "solve_network_gt",
+            opts="Gt",
+            clusters="adm",
+            configfiles="config/config_clustering.yaml",
             sector_opts="",
-            planning_horizons="2030",
+            planning_horizons="2050",
         )
     configure_logging(snakemake)
     set_scenario_config(snakemake)
@@ -1432,6 +1566,12 @@ if __name__ == "__main__":
     # Load network
     n = pypsa.Network(snakemake.input.network)
     planning_horizons = snakemake.wildcards.get("planning_horizons", None)
+
+    # Runtime GT seasonal-storage parameters
+    geotemporal_cfg = getattr(snakemake.params, "geotemporal", {}) or {}
+
+    if geotemporal_cfg:
+        geotemporal_cfg["days_assignment"] = str(snakemake.input.days_assignment)
 
     # Prepare network (settings before solving)
     prepare_network(
@@ -1497,6 +1637,24 @@ if __name__ == "__main__":
 
             logger.info("Solving model...")
             status, condition = n.optimize.solve_model(**solve_kwargs)
+            _attach_seasonal_storage_results(n)
+            if hasattr(n, "storage_units_t_full_soc"):
+                out_soc = Path(str(snakemake.output.network)).with_name(
+                    Path(str(snakemake.output.network)).stem + "_storage_units_t_full_soc.csv"
+                )
+                n.storage_units_t_full_soc.to_csv(out_soc)
+
+            if hasattr(n, "full_timeline"):
+                out_timeline = Path(str(snakemake.output.network)).with_name(
+                    Path(str(snakemake.output.network)).stem + "_full_timeline.csv"
+                )
+                n.full_timeline.to_csv(out_timeline)
+
+            if hasattr(n, "stores_t_full_e"):
+                out_store = Path(str(snakemake.output.network)).with_name(
+                    Path(str(snakemake.output.network)).stem + "_stores_t_full_e.csv"
+                )
+                n.stores_t_full_e.to_csv(out_store)
 
         else:
             logger.info("Using iterative transmission expansion optimization...")

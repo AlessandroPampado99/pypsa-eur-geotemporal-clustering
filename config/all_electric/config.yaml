@@ -37,7 +37,7 @@ foresight: overnight
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#scenario
 scenario:
   clusters:
-  - 'adm'
+  - 25
   opts:
   - ""
   sector_opts:
@@ -1052,9 +1052,9 @@ costs:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#clustering
 clustering:
-  mode: administrative
+  mode: busmap
   administrative:
-    level: 2
+    level: 1
     countries: {}
   focus_weights: false
   copperplate_regions: []
@@ -1083,6 +1083,8 @@ clustering:
     resolution_elec: 1H
     resolution_sector: false
   geotemporal:
+    seasonal_storage:
+      cyclic: true
     # Activated automatically when "Gt" is present in the {opts} wildcard.
     # No explicit enable/disable flag is provided by design.
     buses:
@@ -1152,7 +1154,7 @@ adjustments:
 solving:
   options:
     clip_p_max_pu: 0.01
-    load_shedding: false
+    load_shedding: true
     curtailment_mode: false
     noisy_costs: true
     skip_iterations: true

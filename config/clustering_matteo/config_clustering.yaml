@@ -20,11 +20,11 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "clustering_prova"
-  name: "prova"
+  prefix: "clustering_tuning"
+  name: all
   scenarios:
-    enable: false
-    file: config/scenarios.yaml
+    enable: true
+    file: config/clustering_matteo/scenarios.yaml
   disable_progressbar: false
   shared_resources:
     policy: false

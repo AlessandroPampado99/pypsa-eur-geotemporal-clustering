@@ -1,0 +1,162 @@
+Guida rapida: aggiungere nuovi scenari di geo-temporal clustering e lanciarli
+
+Questa configurazione permette di definire più scenari di geo-temporal clustering tramite file YAML.
+Il file di configurazione principale da usare per il lancio è:
+
+config/clustering_matteo/config_clustering.yaml
+
+I diversi scenari vanno definiti nel file:
+
+config/clustering_matteo/scenarios.yaml
+
+
+1. Come aggiungere nuovi scenari
+--------------------------------
+
+Per aggiungere un nuovo scenario, basta creare una nuova voce in scenarios.yaml che sovrascriva solo la parte desiderata del geotemporal clustering.
+
+Ad esempio:
+
+gt-0.50-0.30-0.30:
+  clustering:
+    geotemporal:
+      reducer:
+        lambda_ts: 0.50
+        node_threshold: 0.30
+        day_threshold: 0.30
+
+gt-0.75-0.28-0.22-True:
+  clustering:
+    geotemporal:
+      reducer:
+        lambda_ts: 0.75
+        node_threshold: 0.28
+        day_threshold: 0.22
+        pca_days:
+          enable: true
+          n_components: 0.95
+          standardize_day_matrix_cols: false
+
+La convenzione usata per i nomi è:
+
+gt-{lambda_ts}-{node_threshold}-{day_threshold}
+gt-{lambda_ts}-{node_threshold}-{day_threshold}-True
+
+Il suffisso "-True" viene usato solo quando pca_days.enable è impostato a true.
+
+
+2. Cosa è personalizzabile
+--------------------------
+
+Tutte le grandezze del blocco geotemporal sono personalizzabili aggiungendole negli scenari dentro scenarios.yaml.
+
+Non solo:
+- lambda_ts
+- node_threshold
+- day_threshold
+- pca_days.enable
+
+ma anche eventuali altre opzioni presenti nel config, per esempio:
+- features.stats
+- features.feature_mode
+- reducer.normalize
+- reducer.linkage
+- reducer.max_iter
+- reconstruction snapshots/corridors
+- outputs
+
+In pratica, per sapere quali parametri si possono modificare, basta guardare il file di configurazione principale e replicare negli scenari soltanto il pezzo che si vuole sovrascrivere.
+
+Ad esempio, se si vogliono cambiare le statistiche usate nelle feature giornaliere, si può fare una cosa del tipo:
+
+gt-custom-stats:
+  clustering:
+    geotemporal:
+      features:
+        stats: ["mean", "max", "std", "energy"]
+      reducer:
+        lambda_ts: 0.50
+        node_threshold: 0.30
+        day_threshold: 0.30
+
+Quindi scenarios.yaml può essere usato non solo per fare tuning di lambda e threshold, ma in generale per esplorare configurazioni diverse del geotemporal clustering.
+
+
+3. Come vengono lanciati tutti gli scenari
+------------------------------------------
+
+Snakemake non lancia automaticamente tutti gli scenari se si richiede direttamente un singolo file di output.
+
+Se si passa come target un path specifico, viene costruita solo quella specifica combinazione di wildcard.
+
+Per lanciare invece tutti gli scenari definiti in config["scenario"], si usa una rule aggregatrice, ad esempio:
+
+rule plot_geo_temporal_cluster_networks:
+    input:
+        expand(
+            resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_map.png"),
+            **config["scenario"],
+        )
+
+Questa rule forza Snakemake a costruire tutti i nodes_map.png per tutte le combinazioni di scenari presenti nella configurazione.
+
+
+4. Come lanciare tutti i plot di geo-temporal clustering
+--------------------------------------------------------
+
+Comando:
+
+snakemake --configfile config/clustering_matteo/config_clustering.yaml --cores 1 plot_geo_temporal_cluster_networks
+
+Versione dry-run:
+
+snakemake --configfile config/clustering_matteo/config_clustering.yaml --cores 1 -n plot_geo_temporal_cluster_networks
+
+
+5. Come fare analisi su un sottoinsieme di scenari
+--------------------------------------------------
+
+Se si vogliono analizzare solo alcune configurazioni, conviene creare un file separato, ad esempio:
+
+config/clustering_matteo/scenarios_optimization.yaml
+
+Dentro questo file si copiano soltanto gli scenari di interesse.
+
+Poi nel file:
+
+config/clustering_matteo/config_clustering.yaml
+
+si cambia la parte relativa agli scenari nel blocco run, ad esempio:
+
+run:
+  prefix: "clustering_tuning"
+  name: all
+  scenarios:
+    enable: true
+    file: config/clustering_matteo/scenarios_optimization.yaml
+
+In questo modo il workflow userà soltanto gli scenari presenti nel nuovo file.
+
+
+6. Come lanciare l’intero workflow elettrico su tutti gli scenari scelti
+------------------------------------------------------------------------
+
+Una volta impostato nel config il file corretto degli scenari, si può lanciare tutto il workflow elettrico con:
+
+snakemake -j<quanti_vuole> all_electric --configfile config/clustering_matteo/config_clustering.yaml
+
+Ad esempio:
+
+snakemake -j8 all_electric --configfile config/clustering_matteo/config_clustering.yaml
+
+Questo comando costruisce tutte le regole necessarie incluse nella pipeline all_electric per tutti gli scenari definiti nel file specificato nel blocco run.scenarios.file.
+
+
+7. Nota pratica
+---------------
+
+Il parametro run.name non modifica il nome del file finale, ma solo la cartella di output in cui esso viene salvato.
+La funzione resources() tiene già conto automaticamente di questa cartella.
+
+Per questo motivo non serve passare run dentro expand(), a meno che il pattern del file non contenga esplicitamente il wildcard {run}.
+In questo workflow non è necessario.

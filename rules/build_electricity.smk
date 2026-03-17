@@ -1008,4 +1008,5 @@ rule plot_geo_temporal_cluster_networks:
         expand(
             resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_map.png"),
             **config["scenario"],
+            run=config["run"]["name"],
         )

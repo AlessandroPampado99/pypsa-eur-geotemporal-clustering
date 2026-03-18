@@ -1250,8 +1250,8 @@ def extra_functionality(
     geotemporal_cfg = getattr(n, "params", {}).get("geotemporal", {}) or {}
     seasonal_storage_cfg = geotemporal_cfg.get("seasonal_storage", {}) or {}
 
-    opts = config['scenario']['opts']
-    is_gt_run = "Gt" in opts
+    days_assignment_path = geotemporal_cfg.get("days_assignment")
+    is_gt_run = bool(days_assignment_path)
 
     if is_gt_run:
         days_assignment_path = geotemporal_cfg['days_assignment']
@@ -1550,9 +1550,10 @@ if __name__ == "__main__":
             "solve_network_gt",
             opts="Gt",
             clusters="adm",
-            configfiles="config/config_clustering.yaml",
+            configfiles="config/clustering_matteo/config_clustering.yaml",
             sector_opts="",
             planning_horizons="2050",
+            run="gt-0.50-0.30-0.30"
         )
     configure_logging(snakemake)
     set_scenario_config(snakemake)

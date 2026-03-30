@@ -962,6 +962,7 @@ rule geo_temporal_cluster_network:
         geotemporal=config_provider("clustering", "geotemporal", default={})
     input:
         network=resources("networks/base_s_{clusters}_elec_{opts}.nc"),
+        regions=resources("regions_onshore_base_s_{clusters}.geojson"),
     output:
         network=resources("networks/base_s_{clusters}_elec_{opts}_gt.nc"),
         nodes_assignment=resources("geotemporal_clustering/base_s_{clusters}_elec_{opts}/nodes_assignment.csv"),

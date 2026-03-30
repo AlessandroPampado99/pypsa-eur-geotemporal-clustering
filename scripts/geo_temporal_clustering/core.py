@@ -12,10 +12,257 @@ from typing import Dict, List, Tuple, Optional, Literal, Union
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
+import geopandas as gpd
 
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import pairwise_distances
 from sklearn.decomposition import PCA
+
+
+# =============================================================================
+# Spatial adjacency utilities
+# =============================================================================
+
+def _prepare_regions_geodataframe(
+    regions_gdf: gpd.GeoDataFrame,
+    *,
+    region_name_col: str = "name",
+) -> gpd.GeoDataFrame:
+    """
+    Validate and standardize the input regions GeoDataFrame.
+
+    Notes
+    -----
+    - The region identifier column is cast to string.
+    - Duplicate region names are dissolved to ensure uniqueness.
+    - The geometry is converted to EPSG:4326 for spatial joins.
+    """
+    if region_name_col not in regions_gdf.columns:
+        raise ValueError(f"Column '{region_name_col}' not found in regions_gdf.")
+
+    regions = regions_gdf[[region_name_col, "geometry"]].copy()
+
+    if regions.empty:
+        raise ValueError("regions_gdf is empty.")
+
+    if regions.crs is None:
+        regions = regions.set_crs("EPSG:4326")
+    else:
+        regions = regions.to_crs("EPSG:4326")
+
+    regions[region_name_col] = regions[region_name_col].astype(str)
+
+    # Dissolve duplicate region identifiers if needed
+    if regions[region_name_col].duplicated().any():
+        regions = regions.dissolve(by=region_name_col, as_index=False)
+
+    # Drop empty geometries if any
+    regions = regions[~regions.geometry.is_empty & regions.geometry.notna()].copy()
+
+    if regions.empty:
+        raise ValueError("No valid geometries left in regions_gdf after cleaning.")
+
+    return regions.reset_index(drop=True)
+
+
+def build_bus_region_membership(
+    buses: List[str],
+    bus_lon: np.ndarray,
+    bus_lat: np.ndarray,
+    regions_gdf: gpd.GeoDataFrame,
+    *,
+    region_name_col: str = "name",
+) -> pd.Series:
+    """
+    Assign each bus to one input region polygon.
+
+    Strategy
+    --------
+    1. Try strict containment ("within").
+    2. For unmatched buses, try topological intersection ("intersects").
+    3. For still unmatched buses, assign the nearest region centroid.
+
+    Returns
+    -------
+    pd.Series
+        Index = bus names, values = assigned region identifiers.
+    """
+    regions = _prepare_regions_geodataframe(
+        regions_gdf,
+        region_name_col=region_name_col,
+    )
+
+    buses = list(map(str, buses))
+    bus_lon = np.asarray(bus_lon, dtype=float)
+    bus_lat = np.asarray(bus_lat, dtype=float)
+
+    if len(buses) != len(bus_lon) or len(buses) != len(bus_lat):
+        raise ValueError("buses, bus_lon, and bus_lat must have the same length.")
+
+    points = gpd.GeoDataFrame(
+        {"bus": buses},
+        geometry=gpd.points_from_xy(bus_lon, bus_lat),
+        crs="EPSG:4326",
+    )
+
+    membership = pd.Series(index=buses, dtype=object, name=region_name_col)
+
+    # Step 1: strict containment
+    joined_within = gpd.sjoin(
+        points,
+        regions[[region_name_col, "geometry"]],
+        how="left",
+        predicate="within",
+    )
+
+    if not joined_within.empty:
+        tmp = (
+            joined_within[["bus", region_name_col]]
+            .dropna(subset=[region_name_col])
+            .drop_duplicates(subset=["bus"], keep="first")
+            .set_index("bus")[region_name_col]
+        )
+        membership.loc[tmp.index] = tmp
+
+    # Step 2: fallback to intersects for buses on borders
+    missing = membership[membership.isna()].index.tolist()
+    if missing:
+        joined_intersects = gpd.sjoin(
+            points.loc[points["bus"].isin(missing)],
+            regions[[region_name_col, "geometry"]],
+            how="left",
+            predicate="intersects",
+        )
+
+        if not joined_intersects.empty:
+            tmp = (
+                joined_intersects[["bus", region_name_col]]
+                .dropna(subset=[region_name_col])
+                .drop_duplicates(subset=["bus"], keep="first")
+                .set_index("bus")[region_name_col]
+            )
+            membership.loc[tmp.index] = tmp
+
+    # Step 3: nearest centroid in projected CRS
+    missing = membership[membership.isna()].index.tolist()
+    if missing:
+        regions_proj = regions.to_crs("EPSG:3035")
+        points_proj = points.to_crs("EPSG:3035")
+
+        centroids_proj = regions_proj.copy()
+        centroids_proj["geometry"] = centroids_proj.geometry.centroid
+
+        nearest = gpd.sjoin_nearest(
+            points_proj.loc[points_proj["bus"].isin(missing)],
+            centroids_proj[[region_name_col, "geometry"]],
+            how="left",
+        )
+
+        if not nearest.empty:
+            tmp = (
+                nearest[["bus", region_name_col]]
+                .dropna(subset=[region_name_col])
+                .drop_duplicates(subset=["bus"], keep="first")
+                .set_index("bus")[region_name_col]
+            )
+            membership.loc[tmp.index] = tmp
+
+    if membership.isna().any():
+        bad = membership[membership.isna()].index.tolist()
+        raise ValueError(
+            f"Could not assign all buses to regions. Missing: {bad[:10]}"
+            f"{'...' if len(bad) > 10 else ''}"
+        )
+
+    return membership.reindex(buses)
+
+
+def build_region_adjacency_matrix(
+    regions_gdf: gpd.GeoDataFrame,
+    *,
+    region_name_col: str = "name",
+    include_self: bool = True,
+) -> pd.DataFrame:
+    """
+    Build a symmetric adjacency matrix between input regions.
+
+    Two regions are considered adjacent if their polygons touch or intersect.
+    The use of intersects in addition to touches makes the procedure more
+    robust to imperfect geometries.
+    """
+    regions = _prepare_regions_geodataframe(
+        regions_gdf,
+        region_name_col=region_name_col,
+    )
+
+    names = regions[region_name_col].tolist()
+    n = len(names)
+
+    A = np.zeros((n, n), dtype=bool)
+
+    geoms = regions.geometry.values
+
+    for i in range(n):
+        gi = geoms[i]
+        for j in range(i + 1, n):
+            gj = geoms[j]
+            if gi.touches(gj) or gi.intersects(gj):
+                A[i, j] = True
+                A[j, i] = True
+
+    if include_self:
+        np.fill_diagonal(A, True)
+
+    return pd.DataFrame(A, index=names, columns=names)
+
+
+def build_bus_connectivity_from_regions(
+    buses: List[str],
+    lat_deg: np.ndarray,
+    lon_deg: np.ndarray,
+    regions_gdf: gpd.GeoDataFrame,
+    *,
+    region_name_col: str = "name",
+) -> Tuple[sp.csr_matrix, pd.Series]:
+    """
+    Build sparse bus-to-bus connectivity matrix from input region adjacency.
+
+    Two buses are connectable if:
+    - they belong to the same region, or
+    - their assigned regions are adjacent.
+
+    Returns
+    -------
+    A_bus : scipy.sparse.csr_matrix
+        Sparse connectivity matrix of shape (N, N).
+    membership : pd.Series
+        Mapping bus -> assigned region.
+    """
+    buses = list(map(str, buses))
+    membership = build_bus_region_membership(
+        buses=buses,
+        bus_lon=np.asarray(lon_deg, dtype=float),
+        bus_lat=np.asarray(lat_deg, dtype=float),
+        regions_gdf=regions_gdf,
+        region_name_col=region_name_col,
+    )
+
+    A_regions = build_region_adjacency_matrix(
+        regions_gdf,
+        region_name_col=region_name_col,
+        include_self=True,
+    )
+
+    bus_regions = membership.reindex(buses).astype(str).to_numpy()
+    region_idx = {r: i for i, r in enumerate(A_regions.index.astype(str))}
+    region_ids = np.array([region_idx[r] for r in bus_regions], dtype=int)
+
+    A_regions_np = A_regions.to_numpy(dtype=bool)
+    A_bus_np = A_regions_np[np.ix_(region_ids, region_ids)]
+
+    A_bus = sp.csr_matrix(A_bus_np.astype(np.float64))
+    return A_bus, membership
 
 
 # =============================================================================
@@ -40,7 +287,12 @@ def haversine_pairwise_km(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarra
     return R * c
 
 
-def normalize_distance_matrix(D: np.ndarray, *, q: float = 0.95, eps: float = 1e-12) -> np.ndarray:
+def normalize_distance_matrix(
+    D: np.ndarray,
+    *,
+    q: float = 0.95,
+    eps: float = 1e-12,
+) -> np.ndarray:
     """
     Normalize distances to ~[0,1] using a robust scale (q-quantile of off-diagonal),
     then clip to [0,1]. Thresholds are interpreted in this normalized space.
@@ -99,7 +351,10 @@ def build_tensor_X(
         if np.isnan(arr).any() or np.isinf(arr).any():
             raise ValueError(f"Attribute '{k}' contains NaN/inf. Clean first.")
 
-    X_attr = {k: np.asarray(data_hourly[k], dtype=float).reshape(N, D, hours_per_day) for k in keys}
+    X_attr = {
+        k: np.asarray(data_hourly[k], dtype=float).reshape(N, D, hours_per_day)
+        for k in keys
+    }
 
     feature_names: List[str] = []
     blocks: List[np.ndarray] = []
@@ -141,10 +396,10 @@ def build_tensor_X(
             if len(feats) == 0:
                 raise ValueError("No stats selected in daily_stats mode.")
 
-            blocks.append(np.concatenate(feats, axis=2))  # (N, D, n_stats_attr)
+            blocks.append(np.concatenate(feats, axis=2))
             feature_names += names
 
-        X = np.concatenate(blocks, axis=2)  # (N, D, F)
+        X = np.concatenate(blocks, axis=2)
         return X, feature_names
 
     raise ValueError("feature_mode must be 'flatten' or 'daily_stats'.")
@@ -177,7 +432,10 @@ def medoid_index(D_within: np.ndarray) -> int:
     return int(np.argmin(D_within.sum(axis=1)))
 
 
-def representative_medoids(D_full: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def representative_medoids(
+    D_full: np.ndarray,
+    labels: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Given a distance matrix among items and cluster labels,
     return medoid indices and weights (= cluster sizes).
@@ -234,23 +492,30 @@ def _agglomerative_precomputed(
     D: np.ndarray,
     *,
     distance_threshold: float,
-    linkage: Literal["average", "complete"]
+    linkage: Literal["average", "complete"],
+    connectivity=None,
 ) -> np.ndarray:
-    """Agglomerative clustering on precomputed distances with distance_threshold."""
+    """Agglomerative clustering on precomputed distances with optional connectivity."""
+    kwargs = dict(
+        n_clusters=None,
+        linkage=linkage,
+        distance_threshold=float(distance_threshold),
+    )
+
+    if connectivity is not None:
+        kwargs["connectivity"] = connectivity
+
     try:
         model = AgglomerativeClustering(
-            n_clusters=None,
             metric="precomputed",
-            linkage=linkage,
-            distance_threshold=float(distance_threshold),
+            **kwargs,
         )
     except TypeError:
         model = AgglomerativeClustering(
-            n_clusters=None,
             affinity="precomputed",
-            linkage=linkage,
-            distance_threshold=float(distance_threshold),
+            **kwargs,
         )
+
     return model.fit_predict(D).astype(int)
 
 
@@ -363,13 +628,21 @@ def build_day_distance(
         if isinstance(pca_n_components, float):
             if not (0.0 < pca_n_components <= 1.0):
                 raise ValueError("pca_n_components as float must be in (0,1].")
-            pca = PCA(n_components=pca_n_components, svd_solver="full", random_state=pca_random_state)
+            pca = PCA(
+                n_components=pca_n_components,
+                svd_solver="full",
+                random_state=pca_random_state,
+            )
         else:
             if int(pca_n_components) < 1:
                 raise ValueError("pca_n_components as int must be >= 1.")
-            pca = PCA(n_components=int(pca_n_components), svd_solver="randomized", random_state=pca_random_state)
+            pca = PCA(
+                n_components=int(pca_n_components),
+                svd_solver="randomized",
+                random_state=pca_random_state,
+            )
 
-        Z = pca.fit_transform(Y)  # (D, r)
+        Z = pca.fit_transform(Y)
         D_day_raw = pairwise_distances(Z, metric="euclidean")
 
         evr = pca.explained_variance_ratio_
@@ -397,6 +670,7 @@ class ReductionResult:
     rep_weights: np.ndarray
     history: List[dict]
     day_pca_info: dict
+    region_membership: Optional[pd.Series] = None
 
 
 class AlternatingSpatioTemporalReducer:
@@ -406,6 +680,7 @@ class AlternatingSpatioTemporalReducer:
     - Iter >=1: node clustering uses ONLY representative days (medoids) with weights.
     - Day clustering ALWAYS uses ALL days, but on spatially aggregated representation defined by current node clusters.
     - Optional PCA in the day clustering distance computation.
+    - Optional spatial adjacency constraint on node merges.
     """
 
     def __init__(
@@ -415,7 +690,7 @@ class AlternatingSpatioTemporalReducer:
         normalize: Literal["zscore", "minmax"] = "zscore",
         node_threshold: float = 0.25,
         day_threshold: float = 0.30,
-        linkage: Literal["average", "complete"] = "average",
+        linkage: Literal["average", "complete"] = "complete",
         max_iter: int = 10,
         tol_no_change: int = 2,
         verbose: bool = True,
@@ -424,6 +699,9 @@ class AlternatingSpatioTemporalReducer:
         pca_days_n_components: Union[int, float] = 0.95,
         pca_days_random_state: int = 0,
         standardize_day_matrix_cols: bool = False,
+        enforce_spatial_adjacency: bool = False,
+        regions_gdf: Optional[gpd.GeoDataFrame] = None,
+        region_name_col: str = "name",
     ):
         self.lambda_ts = float(lambda_ts)
         self.normalize = normalize
@@ -440,12 +718,17 @@ class AlternatingSpatioTemporalReducer:
         self.pca_days_random_state = int(pca_days_random_state)
         self.standardize_day_matrix_cols = bool(standardize_day_matrix_cols)
 
+        self.enforce_spatial_adjacency = bool(enforce_spatial_adjacency)
+        self.regions_gdf = regions_gdf
+        self.region_name_col = str(region_name_col)
+
     def fit(
         self,
         X: np.ndarray,
         lat_deg: np.ndarray,
         lon_deg: np.ndarray,
         *,
+        buses: Optional[List[str]] = None,
         node_weights: Optional[np.ndarray] = None,
     ) -> ReductionResult:
         X = np.asarray(X, dtype=float)
@@ -455,6 +738,12 @@ class AlternatingSpatioTemporalReducer:
         lon_deg = np.asarray(lon_deg, dtype=float)
         if lat_deg.shape != (N,) or lon_deg.shape != (N,):
             raise ValueError("lat_deg and lon_deg must have shape (N,).")
+
+        if buses is None:
+            raise ValueError("buses must be provided when fitting the spatial reducer.")
+        if len(buses) != N:
+            raise ValueError("buses must have length N.")
+        buses = list(map(str, buses))
 
         # Feature-wise normalization
         if self.normalize == "zscore":
@@ -466,6 +755,30 @@ class AlternatingSpatioTemporalReducer:
 
         D_geo = haversine_pairwise_km(lat_deg, lon_deg)
         D_geo_n = normalize_distance_matrix(D_geo, q=self.norm_q)
+
+        node_connectivity = None
+        region_membership = None
+
+        if self.enforce_spatial_adjacency:
+            if self.regions_gdf is None:
+                raise ValueError(
+                    "regions_gdf must be provided when enforce_spatial_adjacency=True."
+                )
+
+            node_connectivity, region_membership = build_bus_connectivity_from_regions(
+                buses=buses,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+                regions_gdf=self.regions_gdf,
+                region_name_col=self.region_name_col,
+            )
+
+            if self.verbose:
+                n_allowed_pairs = int(node_connectivity.nnz)
+                print(
+                    f"[Adjacency] Spatial connectivity enabled | "
+                    f"nodes={N} | allowed_pairs={n_allowed_pairs}"
+                )
 
         history: List[dict] = []
         stable_counter = 0
@@ -495,12 +808,19 @@ class AlternatingSpatioTemporalReducer:
             D_node = self.lambda_ts * D_ts_n + (1.0 - self.lambda_ts) * D_geo_n
 
             labels_nodes = _agglomerative_precomputed(
-                D_node, distance_threshold=self.node_threshold, linkage=self.linkage
+                D_node,
+                distance_threshold=self.node_threshold,
+                linkage=self.linkage,
+                connectivity=node_connectivity,
             )
             K_nodes = int(len(np.unique(labels_nodes)))
 
             # 2) Day clustering (always on ALL days)
-            X_agg, cluster_sizes = aggregate_nodes_by_cluster(Xn, labels_nodes, node_weights=node_weights)
+            X_agg, cluster_sizes = aggregate_nodes_by_cluster(
+                Xn,
+                labels_nodes,
+                node_weights=node_weights,
+            )
 
             D_day_raw, day_pca_info = build_day_distance(
                 X_agg,
@@ -515,7 +835,9 @@ class AlternatingSpatioTemporalReducer:
             D_day_n = normalize_distance_matrix(D_day_raw, q=self.norm_q)
 
             labels_days = _agglomerative_precomputed(
-                D_day_n, distance_threshold=self.day_threshold, linkage=self.linkage
+                D_day_n,
+                distance_threshold=self.day_threshold,
+                linkage=self.linkage,
             )
             K_days = int(len(np.unique(labels_days)))
 
@@ -529,6 +851,7 @@ class AlternatingSpatioTemporalReducer:
                     K_days=K_days,
                     n_rep_days=int(len(rep_days)),
                     day_pca=day_pca_info,
+                    adjacency_enabled=bool(self.enforce_spatial_adjacency),
                 )
             )
 
@@ -539,13 +862,21 @@ class AlternatingSpatioTemporalReducer:
                     pca_str = f"PCA(r={r}, EV={ev:.3f})"
                 else:
                     pca_str = "no PCA"
+
                 print(
                     f"[Iter {it}] used_days_for_nodes={used_days} | "
-                    f"K_nodes={K_nodes} | K_days={K_days} | rep_days={len(rep_days)} | {pca_str}"
+                    f"K_nodes={K_nodes} | K_days={K_days} | "
+                    f"rep_days={len(rep_days)} | {pca_str}"
                 )
 
-            same_nodes = labels_nodes_prev is not None and np.array_equal(labels_nodes, labels_nodes_prev)
-            same_days = labels_days_prev is not None and np.array_equal(labels_days, labels_days_prev)
+            same_nodes = (
+                labels_nodes_prev is not None
+                and np.array_equal(labels_nodes, labels_nodes_prev)
+            )
+            same_days = (
+                labels_days_prev is not None
+                and np.array_equal(labels_days, labels_days_prev)
+            )
 
             stable_counter = stable_counter + 1 if (same_nodes and same_days) else 0
 
@@ -564,6 +895,7 @@ class AlternatingSpatioTemporalReducer:
             rep_weights=rep_weights.astype(int),
             history=history,
             day_pca_info=last_day_pca_info,
+            region_membership=region_membership,
         )
 
 
@@ -646,7 +978,6 @@ def cf_by_bus_timeseries(
     For buses with no such gens -> 0.
     """
     if getattr(n, "generators", None) is None or n.generators.empty:
-        # No generators at all
         return pd.DataFrame(0.0, index=n.snapshots, columns=buses)
 
     if not hasattr(n, "generators_t") or getattr(n.generators_t, "p_max_pu", None) is None:
@@ -664,7 +995,6 @@ def cf_by_bus_timeseries(
         out.loc[:, :] = 0.0
         return out
 
-    # weights
     if weight_by not in G.columns:
         weights = pd.Series(1.0, index=G.index)
     else:
@@ -718,25 +1048,21 @@ def build_full_busmap(
     labels_nodes = np.asarray(labels_nodes, dtype=int)
     rep_nodes_idx = np.asarray(rep_nodes_idx, dtype=int)
 
-    # Map cluster -> representative base bus
     rep_base_by_cluster: Dict[int, str] = {}
     for idx in rep_nodes_idx:
         c = int(labels_nodes[idx])
         rep_base_by_cluster[c] = base_buses[idx]
 
-    # Map base bus -> rep base bus
     base_to_rep: Dict[str, str] = {}
     for b, c in zip(base_buses, labels_nodes):
         base_to_rep[b] = rep_base_by_cluster[int(c)]
 
-    # Build mapping for all buses
     mapping = {}
     for bus in n.buses.index.astype(str):
         base, suffix = strip_suffix(bus)
         if base in base_to_rep:
             mapping[bus] = base_to_rep[base] + suffix
         else:
-            # Fallback: keep bus (should be rare in electric-only cases)
             mapping[bus] = bus
 
     return pd.Series(mapping, name="busmap").reindex(n.buses.index.astype(str))
@@ -766,33 +1092,31 @@ def apply_temporal_reduction(
     if rep_days.min() < 0 or rep_days.max() >= D:
         raise ValueError("rep_days out of range.")
 
-    # Keep snapshots in chronological order of rep_days
     rep_days_sorted = np.sort(rep_days)
-    keep_idx = np.concatenate([np.arange(d * hours_per_day, (d + 1) * hours_per_day) for d in rep_days_sorted])
+    keep_idx = np.concatenate(
+        [np.arange(d * hours_per_day, (d + 1) * hours_per_day) for d in rep_days_sorted]
+    )
     keep_snaps = snaps[keep_idx]
 
-    # Build per-snapshot multiplier (repeat day weight for each hour)
     day_weight_map = {int(d): float(w) for d, w in zip(rep_days, rep_weights)}
     multipliers = []
     for d in rep_days_sorted:
         multipliers.extend([day_weight_map[int(d)]] * hours_per_day)
     mult = pd.Series(np.asarray(multipliers, dtype=float), index=keep_snaps)
 
-    # Preserve original snapshot weightings for the kept snapshots
     if getattr(n, "snapshot_weightings", None) is not None and not n.snapshot_weightings.empty:
         base_w = n.snapshot_weightings.reindex(keep_snaps).copy()
     else:
         base_w = pd.DataFrame(index=keep_snaps, data={"objective": 1.0})
 
-    # Reduce snapshots (prefer the public API if present)
     if hasattr(n, "set_snapshots"):
         n.set_snapshots(keep_snaps)
     else:
-        # Fallback: set snapshots and reindex known *_t containers
         n.snapshots = keep_snaps
 
-    # Restore and scale snapshot_weightings
     n.snapshot_weightings = base_w.reindex(n.snapshots).copy()
     for col in n.snapshot_weightings.columns:
-        n.snapshot_weightings[col] = n.snapshot_weightings[col].astype(float) * mult.reindex(n.snapshots).to_numpy()
-
+        n.snapshot_weightings[col] = (
+            n.snapshot_weightings[col].astype(float)
+            * mult.reindex(n.snapshots).to_numpy()
+        )

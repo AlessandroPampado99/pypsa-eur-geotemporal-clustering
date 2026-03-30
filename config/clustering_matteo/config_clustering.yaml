@@ -1110,10 +1110,12 @@ clustering:
       # Agglomerative clustering thresholds in normalized distance space [0,1].
       node_threshold: 0.30
       day_threshold: 0.30
-      linkage: "average"  # "average" or "complete"
+      linkage: "complete"  # "average" or "complete"
       max_iter: 10
       tol_no_change: 2
       norm_q: 0.95  # Quantile used for robust distance normalization.
+      enforce_spatial_adjacency: true
+      region_name_col: "name"
       pca_days:
         enable: false
         n_components: 0.95

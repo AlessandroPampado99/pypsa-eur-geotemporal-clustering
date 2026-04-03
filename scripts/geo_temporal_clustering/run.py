@@ -8,7 +8,6 @@ Snakemake entrypoint: geo-temporal clustering + reconstruction for a PyPSA netwo
   * clustered network (spatial + temporal)
   * mapping CSVs (nodes/days assignments, representative selections, busmap/linemap)
 
-All comments are in English by request.
 """
 
 import logging
@@ -33,12 +32,6 @@ if str(ROOT) not in sys.path:
 from scripts._helpers import configure_logging
 from scripts.geo_temporal_clustering.core import (
     AlternatingSpatioTemporalReducer,
-    representative_medoids,
-    build_node_ts_distance,
-    haversine_pairwise_km,
-    normalize_distance_matrix,
-    zscore_global,
-    minmax_global,
     build_tensor_X,
     select_buses_from_loads,
     bus_coords_latlon,
@@ -68,6 +61,39 @@ def _smk_path(namedlist: Any, key: str, idx: int = 0) -> str:
         return str(namedlist[idx])
 
 
+
+def _build_feature_weights(feature_names, cfg_weights):
+    """
+    Build a feature-weight vector from a config dictionary.
+
+    Supported keys:
+    - exact feature name, e.g. "load_mean"
+    - attribute prefix, e.g. "load", "pv_cf", "wind_cf"
+      (applied to all derived features whose names start with "<key>_")
+    """
+    weights = np.ones(len(feature_names), dtype=float)
+
+    if not cfg_weights:
+        return weights
+
+    for i, feat in enumerate(feature_names):
+        assigned = False
+
+        if feat in cfg_weights:
+            weights[i] = float(cfg_weights[feat])
+            assigned = True
+
+        if not assigned:
+            for prefix, value in cfg_weights.items():
+                prefix = str(prefix)
+                if feat.startswith(prefix + "_"):
+                    weights[i] = float(value)
+                    assigned = True
+                    break
+
+    return weights
+
+
 def main() -> None:
     configure_logging(snakemake)
     cfg = snakemake.params.get("geotemporal", {}) if hasattr(snakemake, "params") else {}
@@ -94,8 +120,8 @@ def main() -> None:
     pv_cfg = _cfg_get(include, "pv_cf", {"carrier": "solar", "weight_by": "p_nom"}) or {}
     wind_cfg = _cfg_get(include, "wind_cf", {"carrier": "onwind", "weight_by": "p_nom"}) or {}
 
-    # Optional node weights for spatial aggregation in day clustering
-    node_weights_cfg = _cfg_get(_cfg_get(cfg, "features", {}), "node_weights", None)
+    feature_weights_cfg = _cfg_get(_cfg_get(cfg, "objective", {}), "feature_weights", {}) or {}
+    node_weights_cfg = _cfg_get(_cfg_get(cfg, "objective", {}), "node_weights", None)
 
     # Reducer params
     r_cfg = _cfg_get(cfg, "reducer", {}) or {}
@@ -108,27 +134,6 @@ def main() -> None:
         regions_path = _smk_path(snakemake.input, "regions")
         logger.info("Loading input regions for adjacency: %s", regions_path)
         regions_gdf = gpd.read_file(regions_path)
-
-    reducer = AlternatingSpatioTemporalReducer(
-        lambda_ts=float(_cfg_get(r_cfg, "lambda_ts", 0.5)),
-        normalize=str(_cfg_get(r_cfg, "normalize", "zscore")),
-        node_threshold=float(_cfg_get(r_cfg, "node_threshold", 0.30)),
-        day_threshold=float(_cfg_get(r_cfg, "day_threshold", 0.30)),
-        linkage=str(_cfg_get(r_cfg, "linkage", "average")),
-        max_iter=int(_cfg_get(r_cfg, "max_iter", 10)),
-        tol_no_change=int(_cfg_get(r_cfg, "tol_no_change", 2)),
-        verbose=bool(_cfg_get(r_cfg, "verbose", True)),
-        norm_q=float(_cfg_get(r_cfg, "norm_q", 0.95)),
-        use_pca_days=bool(_cfg_get(_cfg_get(r_cfg, "pca_days", {}), "enable", False)),
-        pca_days_n_components=_cfg_get(_cfg_get(r_cfg, "pca_days", {}), "n_components", 0.95),
-        pca_days_random_state=int(_cfg_get(_cfg_get(r_cfg, "pca_days", {}), "random_state", 0)),
-        standardize_day_matrix_cols=bool(
-            _cfg_get(_cfg_get(r_cfg, "pca_days", {}), "standardize_day_matrix_cols", False)
-        ),
-        enforce_spatial_adjacency=enforce_spatial_adjacency,
-        regions_gdf=regions_gdf,
-        region_name_col=region_name_col,
-    )
 
     # ---------------------------------------------------------------------
     # Load network
@@ -188,8 +193,10 @@ def main() -> None:
     )
     logger.info("Built tensor X with shape %s (N, D, F), F=%d.", X.shape, len(feat_names))
 
+    feature_weights = _build_feature_weights(feat_names, feature_weights_cfg)
+
     # ---------------------------------------------------------------------
-    # Optional node weights
+    # Optional node weights for the objective
     # ---------------------------------------------------------------------
     node_weights = None
 
@@ -215,6 +222,33 @@ def main() -> None:
                 "Supported: None, 'none', 'mean_load', 'peak_load'."
             )
 
+    reducer = AlternatingSpatioTemporalReducer(
+        lambda_ts=float(_cfg_get(r_cfg, "lambda_ts", 0.5)),
+        normalize=str(_cfg_get(r_cfg, "normalize", "zscore")),
+        max_total_steps=int(_cfg_get(r_cfg, "max_total_steps", 144)),
+        init_mode=str(_cfg_get(r_cfg, "init_mode", "balanced")),
+        init_nodes=_cfg_get(r_cfg, "init_nodes", None),
+        init_days=_cfg_get(r_cfg, "init_days", None),
+        beta=float(_cfg_get(r_cfg, "beta", 0.15)),
+        max_iter=int(_cfg_get(r_cfg, "max_iter", 20)),
+        tol_no_change=int(_cfg_get(r_cfg, "tol_no_change", 2)),
+        objective_tol_rel=float(_cfg_get(r_cfg, "objective_tol_rel", 1e-5)),
+        verbose=bool(_cfg_get(r_cfg, "verbose", True)),
+        norm_q=float(_cfg_get(r_cfg, "norm_q", 0.95)),
+        use_pca_days=bool(_cfg_get(_cfg_get(r_cfg, "pca_days", {}), "enable", False)),
+        pca_days_n_components=_cfg_get(_cfg_get(r_cfg, "pca_days", {}), "n_components", 0.95),
+        pca_days_random_state=int(_cfg_get(_cfg_get(r_cfg, "pca_days", {}), "random_state", 0)),
+        standardize_day_matrix_cols=bool(
+            _cfg_get(_cfg_get(r_cfg, "pca_days", {}), "standardize_day_matrix_cols", False)
+        ),
+        kmedoids_max_iter=int(_cfg_get(r_cfg, "kmedoids_max_iter", 100)),
+        random_state=int(_cfg_get(r_cfg, "random_state", 0)),
+        enforce_spatial_adjacency=enforce_spatial_adjacency,
+        regions_gdf=regions_gdf,
+        region_name_col=region_name_col,
+        feature_weights=feature_weights,
+    )
+
     # ---------------------------------------------------------------------
     # Run reducer
     # ---------------------------------------------------------------------
@@ -227,34 +261,11 @@ def main() -> None:
     )
 
     logger.info(
-        "Reducer completed: %d node clusters, %d day clusters, %d representative days.",
+        "Reducer completed: %d node clusters, %d day clusters, objective=%.6e.",
         len(np.unique(result.labels_nodes)),
         len(np.unique(result.labels_days)),
-        len(result.rep_days),
+        result.objective,
     )
-
-    # ---------------------------------------------------------------------
-    # Representative nodes (medoids of final spatial clusters)
-    # ---------------------------------------------------------------------
-    if reducer.normalize == "zscore":
-        Xn = zscore_global(X)
-    else:
-        Xn = minmax_global(X)
-
-    D_geo = haversine_pairwise_km(lat, lon)
-    D_geo_n = normalize_distance_matrix(D_geo, q=float(_cfg_get(r_cfg, "norm_q", 0.95)))
-
-    X_for_nodes = Xn[:, result.rep_days, :]
-    w_for_nodes = result.rep_weights.astype(float)
-
-    D_ts_raw = build_node_ts_distance(X_for_nodes, w_for_nodes)
-    D_ts_n = normalize_distance_matrix(D_ts_raw, q=float(_cfg_get(r_cfg, "norm_q", 0.95)))
-
-    lambda_ts = float(_cfg_get(r_cfg, "lambda_ts", 0.5))
-    D_node = lambda_ts * D_ts_n + (1.0 - lambda_ts) * D_geo_n
-
-    rep_nodes_idx, rep_nodes_w = representative_medoids(D_node, result.labels_nodes.astype(int))
-    rep_labels = result.labels_nodes[rep_nodes_idx].astype(int)
 
     # ---------------------------------------------------------------------
     # Build busmap for ALL buses (incl. auxiliary suffix buses)
@@ -263,7 +274,7 @@ def main() -> None:
         n,
         base_buses,
         result.labels_nodes.astype(int),
-        rep_nodes_idx,
+        result.rep_nodes.astype(int),
     )
 
     # ---------------------------------------------------------------------
@@ -333,7 +344,7 @@ def main() -> None:
 
     rep_bus_by_cluster = {
         int(c): base_buses[i]
-        for i, c in zip(rep_nodes_idx, rep_labels)
+        for c, i in enumerate(result.rep_nodes.astype(int))
     }
     df_nodes["rep_bus"] = df_nodes["node_cluster"].map(rep_bus_by_cluster)
 
@@ -347,11 +358,11 @@ def main() -> None:
     # Representative nodes
     df_rep_nodes = pd.DataFrame(
         {
-            "rep_bus": [base_buses[i] for i in rep_nodes_idx],
-            "rep_lat": lat[rep_nodes_idx],
-            "rep_lon": lon[rep_nodes_idx],
-            "rep_node_cluster": rep_labels,
-            "cluster_size": rep_nodes_w.astype(int),
+            "rep_bus": [base_buses[i] for i in result.rep_nodes.astype(int)],
+            "rep_lat": lat[result.rep_nodes.astype(int)],
+            "rep_lon": lon[result.rep_nodes.astype(int)],
+            "rep_node_cluster": np.arange(len(result.rep_nodes), dtype=int),
+            "cluster_size": result.rep_node_weights.astype(int),
         }
     ).sort_values("rep_node_cluster")
     df_rep_nodes.to_csv(out_rep_nodes, index=False)
@@ -364,10 +375,9 @@ def main() -> None:
         }
     )
 
-    rep_day_cluster_labels = df_days.set_index("day_index").loc[result.rep_days, "day_cluster"].values
     rep_day_map = {
         int(cluster_label): int(rep_day)
-        for cluster_label, rep_day in zip(rep_day_cluster_labels, result.rep_days)
+        for cluster_label, rep_day in enumerate(result.rep_days.astype(int))
     }
     df_days["rep_day_index"] = df_days["day_cluster"].map(rep_day_map)
 
@@ -382,13 +392,20 @@ def main() -> None:
         {
             "rep_day_index": result.rep_days.astype(int),
             "rep_weight": result.rep_weights.astype(int),
+            "rep_day_cluster": np.arange(len(result.rep_days), dtype=int),
         }
-    ).sort_values("rep_day_index")
+    ).sort_values("rep_day_cluster")
     df_rep_days.to_csv(out_rep_days, index=False)
 
     # Busmap / Linemap
     busmap.to_csv(out_busmap)
     clustering.linemap.to_csv(out_linemap)
+
+    # Extra history/evaluations CSVs
+    if len(result.history) > 0:
+        pd.DataFrame(result.history).to_csv(outdir / "history.csv", index=False)
+    if len(result.evaluations) > 0:
+        pd.DataFrame(result.evaluations).to_csv(outdir / "evaluations.csv", index=False)
 
     # Summary
     summary = {
@@ -405,21 +422,28 @@ def main() -> None:
         "n_rep_days": int(len(result.rep_days)),
         "n_node_clusters": int(len(np.unique(result.labels_nodes))),
         "n_day_clusters": int(len(np.unique(result.labels_days))),
+        "max_total_steps": int(_cfg_get(r_cfg, "max_total_steps", 144)),
+        "actual_total_steps": int(len(np.unique(result.labels_nodes)) * len(np.unique(result.labels_days))),
+        "objective": float(result.objective),
+        "feature_names": feat_names,
+        "feature_weights": feature_weights.tolist(),
         "spatial_adjacency_enabled": bool(enforce_spatial_adjacency),
         "region_name_col": region_name_col if enforce_spatial_adjacency else None,
         "history": result.history,
+        "evaluations": result.evaluations,
         "day_pca_info": result.day_pca_info,
     }
 
     with open(out_summary, "w", encoding="utf-8") as f:
         for k, v in summary.items():
-            f.write(f"{k}: {v}\n")
+            f.write(f"{k}: {v}\\n")
 
     logger.info("Exporting clustered network: %s", out_network)
     nc.export_to_netcdf(out_network)
 
 
 if __name__ == "__main__":
+
     if "snakemake" not in globals():
         from scripts._helpers import mock_snakemake
 

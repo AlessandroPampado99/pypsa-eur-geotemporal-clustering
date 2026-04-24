@@ -1244,15 +1244,24 @@ class AlternatingSpatioTemporalReducer:
             )
 
         no_improve_counter = 0
+        it_global = 0
+        it_feasible = 0
 
-        for it in range(self.max_iter):
+        # Safety guard only for pathological cases during infeasible reduction
+        max_infeasible_iters = max(10 * self.max_iter, 50)
+
+        # ------------------------------------------------------------------
+        # Phase 1: mandatory reduction until the solution is feasible
+        # ------------------------------------------------------------------
+        while int(current_solution["total_steps"]) > target_budget:
             current_budget = int(current_solution["total_steps"])
             current_obj = float(current_solution["objective"])
 
             history.append(
                 dict(
-                    iter=int(it),
-                    status="accepted",
+                    iter=int(it_global),
+                    phase="reduce_to_budget",
+                    status="accepted_infeasible",
                     K_nodes=int(current_solution["K_nodes"]),
                     K_days=int(current_solution["K_days"]),
                     total_steps=int(current_solution["total_steps"]),
@@ -1262,36 +1271,136 @@ class AlternatingSpatioTemporalReducer:
 
             if self.verbose:
                 print(
-                    f"[Iter {it}] accepted | "
+                    f"[Iter {it_global}] accepted_infeasible | "
                     f"K_nodes={current_solution['K_nodes']} | "
                     f"K_days={current_solution['K_days']} | "
                     f"steps={current_solution['total_steps']} | "
                     f"objective={current_obj:.6e}"
                 )
 
-            if current_budget > target_budget:
-                next_budget = max(target_budget, int(np.floor(current_budget * (1.0 - self.beta))))
-                candidate_pairs = self._candidate_pairs_reduce_budget(
-                    int(current_solution["K_nodes"]),
-                    int(current_solution["K_days"]),
-                    next_budget,
-                    N,
-                    D,
+            next_budget = max(
+                target_budget,
+                int(np.floor(current_budget * (1.0 - self.beta)))
+            )
+
+            candidate_pairs = self._candidate_pairs_reduce_budget(
+                int(current_solution["K_nodes"]),
+                int(current_solution["K_days"]),
+                next_budget,
+                N,
+                D,
+            )
+
+            if len(candidate_pairs) == 0:
+                # Hard fallback: jump directly to a balanced feasible pair
+                kn_bal, kd_bal = self._balanced_pair(N, D, target_budget)
+                candidate_pairs = [(kn_bal, kd_bal, "force_feasible_balanced")]
+
+            seed_days = current_solution["rep_days"]
+            seed_weights = current_solution["rep_weights"]
+
+            candidate_solutions = []
+            for cand_kn, cand_kd, move_type in candidate_pairs:
+                cand = self._solve_for_pair(
+                    Xn,
+                    D_geo_n,
+                    seed_days,
+                    seed_weights,
+                    cand_kn,
+                    cand_kd,
+                    node_loss_weights=node_loss_weights,
                 )
-                require_accept = True
+                cand["move_type"] = move_type
+                candidate_solutions.append(cand)
+
+                evaluations.append(
+                    dict(
+                        iter=int(it_global),
+                        phase="reduce_to_budget",
+                        move_type=str(move_type),
+                        K_nodes=int(cand["K_nodes"]),
+                        K_days=int(cand["K_days"]),
+                        total_steps=int(cand["total_steps"]),
+                        objective=float(cand["objective"]),
+                    )
+                )
+
+                if self.verbose:
+                    print(
+                        f"    candidate={move_type:>22s} | "
+                        f"K_nodes={cand['K_nodes']} | "
+                        f"K_days={cand['K_days']} | "
+                        f"steps={cand['total_steps']} | "
+                        f"objective={cand['objective']:.6e}"
+                    )
+
+            # Among reduction candidates, prefer feasibility first, then lower objective
+            feasible_candidates = [
+                c for c in candidate_solutions if int(c["total_steps"]) <= target_budget
+            ]
+
+            if feasible_candidates:
+                best_candidate = min(feasible_candidates, key=lambda s: float(s["objective"]))
             else:
-                candidate_pairs = self._candidate_pairs_rebalance(
-                    int(current_solution["K_nodes"]),
-                    int(current_solution["K_days"]),
-                    target_budget,
-                    N,
-                    D,
+                # If none is feasible yet, keep reducing. Prefer the smallest total_steps,
+                # then the lowest objective among those.
+                best_candidate = min(
+                    candidate_solutions,
+                    key=lambda s: (int(s["total_steps"]), float(s["objective"])),
                 )
-                require_accept = False
+
+            current_solution = best_candidate
+            it_global += 1
+
+            if it_global >= max_infeasible_iters and int(current_solution["total_steps"]) > target_budget:
+                raise RuntimeError(
+                    "The reducer could not reach a feasible solution under max_total_steps. "
+                    f"Current total_steps={current_solution['total_steps']}, "
+                    f"target={target_budget}."
+                )
+
+        # Log the first feasible solution before starting local rebalancing
+        current_budget = int(current_solution["total_steps"])
+        current_obj = float(current_solution["objective"])
+        history.append(
+            dict(
+                iter=int(it_global),
+                phase="feasible_search",
+                status="accepted_feasible",
+                K_nodes=int(current_solution["K_nodes"]),
+                K_days=int(current_solution["K_days"]),
+                total_steps=int(current_solution["total_steps"]),
+                objective=float(current_obj),
+            )
+        )
+
+        if self.verbose:
+            print(
+                f"[Iter {it_global}] accepted_feasible | "
+                f"K_nodes={current_solution['K_nodes']} | "
+                f"K_days={current_solution['K_days']} | "
+                f"steps={current_solution['total_steps']} | "
+                f"objective={current_obj:.6e}"
+            )
+
+        # ------------------------------------------------------------------
+        # Phase 2: local search within the feasible region
+        # ------------------------------------------------------------------
+        while it_feasible < self.max_iter:
+            current_budget = int(current_solution["total_steps"])
+            current_obj = float(current_solution["objective"])
+
+            candidate_pairs = self._candidate_pairs_rebalance(
+                int(current_solution["K_nodes"]),
+                int(current_solution["K_days"]),
+                target_budget,
+                N,
+                D,
+            )
 
             if len(candidate_pairs) == 0:
                 if self.verbose:
-                    print("[Stop] No new candidate pairs available.")
+                    print("[Stop] No new feasible candidate pairs available.")
                 break
 
             seed_days = current_solution["rep_days"]
@@ -1313,7 +1422,8 @@ class AlternatingSpatioTemporalReducer:
 
                 evaluations.append(
                     dict(
-                        iter=int(it),
+                        iter=int(it_global + 1),
+                        phase="feasible_search",
                         move_type=str(move_type),
                         K_nodes=int(cand["K_nodes"]),
                         K_days=int(cand["K_days"]),
@@ -1334,11 +1444,6 @@ class AlternatingSpatioTemporalReducer:
             best_candidate = min(candidate_solutions, key=lambda s: float(s["objective"]))
             best_obj = float(best_candidate["objective"])
 
-            if require_accept:
-                current_solution = best_candidate
-                no_improve_counter = 0
-                continue
-
             rel_improvement = (current_obj - best_obj) / max(abs(current_obj), 1e-12)
 
             if best_obj < current_obj and rel_improvement > self.objective_tol_rel:
@@ -1356,9 +1461,40 @@ class AlternatingSpatioTemporalReducer:
                     if self.verbose:
                         print(
                             f"[Converged] No relevant improvement for "
-                            f"{no_improve_counter} consecutive iterations."
+                            f"{no_improve_counter} consecutive feasible iterations."
                         )
                     break
+
+            it_global += 1
+            it_feasible += 1
+
+            history.append(
+                dict(
+                    iter=int(it_global),
+                    phase="feasible_search",
+                    status="accepted_feasible",
+                    K_nodes=int(current_solution["K_nodes"]),
+                    K_days=int(current_solution["K_days"]),
+                    total_steps=int(current_solution["total_steps"]),
+                    objective=float(current_solution["objective"]),
+                )
+            )
+
+            if self.verbose:
+                print(
+                    f"[Iter {it_global}] accepted_feasible | "
+                    f"K_nodes={current_solution['K_nodes']} | "
+                    f"K_days={current_solution['K_days']} | "
+                    f"steps={current_solution['total_steps']} | "
+                    f"objective={current_solution['objective']:.6e}"
+                )
+
+        # Final hard guarantee
+        if int(current_solution["total_steps"]) > target_budget:
+            raise RuntimeError(
+                "The final solution is infeasible: "
+                f"total_steps={current_solution['total_steps']} > max_total_steps={target_budget}."
+            )
 
         return ReductionResult(
             labels_nodes=current_solution["labels_nodes"].astype(int),

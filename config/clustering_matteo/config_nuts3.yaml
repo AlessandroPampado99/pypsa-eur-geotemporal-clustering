@@ -20,11 +20,11 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "clustering_new_algorithm_tuning"
-  name: all
+  prefix: "reference_nuts3"
+  name: complete
   scenarios:
-    enable: true
-    file: config/clustering_matteo/scenarios_new_tuning.yaml
+    enable: false
+    file: config/clustering_matteo/scenarios.yaml
   disable_progressbar: false
   shared_resources:
     policy: false
@@ -39,7 +39,7 @@ scenario:
   clusters:
   - 'adm'
   opts:
-  - "Gt"
+  - ""
   sector_opts:
   - ""
   planning_horizons:
@@ -1069,8 +1069,8 @@ clustering:
   cluster_network:
     algorithm: kmeans
     hac_features:
-      - wnd100m
-      - influx_direct
+    - wnd100m
+    - influx_direct
   exclude_carriers: []
   consider_efficiency_classes: false
   aggregation_strategies:
@@ -1082,75 +1082,62 @@ clustering:
   temporal:
     resolution_elec: 1H
     resolution_sector: false
-
   geotemporal:
     seasonal_storage:
       cyclic: true
-
+    # Activated automatically when "Gt" is present in the {opts} wildcard.
+    # No explicit enable/disable flag is provided by design.
     buses:
-      mode: "loads"
-      exclude_bus_substrings: [" H2", "battery"]
-
+      mode: "loads"  # Use buses referenced by loads (electric-only base networks).
+      exclude_bus_substrings: [" H2", "battery"]  # Drop auxiliary H2/battery buses.
     features:
-      hours_per_day: 24
-      feature_mode: "daily_stats"
-      stats: ["mean", "max", "min", "std", "ramp_max", "energy"]
+      hours_per_day: 24  # Used to reshape snapshots into days (assumes 1h resolution).
+      feature_mode: "daily_stats"  # "daily_stats" or "flatten"
+      stats: ["mean","max","min","std","ramp_max","energy"]  # Only for daily_stats mode
+      # Hourly signals to include in the feature tensor X[node, day, feature].
       include:
-        load: true
+        load: true  # Aggregate loads_t.p_set by bus (sum over loads at same bus).
         pv_cf:
           carrier: "solar"
-          weight_by: "p_nom"
+          weight_by: "p_nom"  # Weighted average of p_max_pu by installed capacity.
         wind_cf:
           carrier: "onwind"
           weight_by: "p_nom"
-
-    objective:
-      feature_weights:
-        load: 1.0
-        pv_cf: 1.0
-        wind_cf: 1.0
-      node_weights: "mean_load"   # "mean_load", "peak_load", or "none"
-
     reducer:
+      # Spatial distance = lambda_ts * temporal_distance + (1-lambda_ts) * geo_distance
       lambda_ts: 0.5
-      normalize: "zscore"
-      max_total_steps: 900
-      init_mode: "balanced"       # "balanced" or "full" balanced -> nearly sqrt total; full from total
-      init_nodes: null # if you want to fix them at the beginning
-      init_days: null
-      beta: 0.15 # spatio temporal balance parameter
-      max_iter: 50
-      tol_no_change: 5
-      objective_tol_rel: 1e-5
-      verbose: true
-      norm_q: 0.95
-      kmedoids_max_iter: 100
-      random_state: 0
-
-      # Important: in the code I gave you this is not implemented yet
-      enforce_spatial_adjacency: false
+      normalize: "zscore"  # "zscore" or "minmax" applied globally over nodes and days.
+      # Agglomerative clustering thresholds in normalized distance space [0,1].
+      node_threshold: 0.30
+      day_threshold: 0.30
+      linkage: "complete"  # "average" or "complete"
+      max_iter: 10
+      tol_no_change: 2
+      norm_q: 0.95  # Quantile used for robust distance normalization.
+      enforce_spatial_adjacency: true
       region_name_col: "name"
-
       pca_days:
         enable: false
         n_components: 0.95
-        random_state: 0
         standardize_day_matrix_cols: false
-
     reconstruction:
-      internal_edges: "drop"
+      # Internal lines/links within the same spatial cluster:
+      internal_edges: "drop"  # Drop edges inside a cluster (implicit copperplate assumption).
+      # Inter-cluster corridors: merge parallel connections between the same pair of super-nodes.
       corridors:
         capacity: "sum"
         impedance: "parallel"
         cost: "weighted_mean_by_capacity"
+      # Temporal reduction: keep only representative (medoid) days and scale snapshot weights accordingly.
       snapshots:
         method: "medoid_days"
         apply_snapshot_weightings: true
-
     outputs:
+      # Store reusable mapping artifacts under resources/ for reproducibility.
       resources_prefix: "geotemporal_clustering"
-      write_mapping_csv: true
-      write_corridor_csv: true
+      write_mapping_csv: true  # bus/day assignment + representative selections
+      write_corridor_csv: true # corridor aggregation summary (recommended)
+      # Store run diagnostics (plots) under results/ for quick inspection.
       write_plots: true
       plots_prefix: "geotemporal_clustering"
 

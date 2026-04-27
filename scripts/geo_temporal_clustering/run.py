@@ -230,6 +230,8 @@ def main() -> None:
         init_nodes=_cfg_get(r_cfg, "init_nodes", None),
         init_days=_cfg_get(r_cfg, "init_days", None),
         beta=float(_cfg_get(r_cfg, "beta", 0.15)),
+        beta_growth=float(_cfg_get(r_cfg, "beta_growth", 2.0)),
+        beta_max=float(_cfg_get(r_cfg, "beta_max", 0.5)),
         max_iter=int(_cfg_get(r_cfg, "max_iter", 20)),
         tol_no_change=int(_cfg_get(r_cfg, "tol_no_change", 2)),
         objective_tol_rel=float(_cfg_get(r_cfg, "objective_tol_rel", 1e-5)),

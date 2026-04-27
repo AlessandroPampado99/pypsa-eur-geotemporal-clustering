@@ -1119,6 +1119,8 @@ clustering:
       init_nodes: null # if you want to fix them at the beginning
       init_days: null
       beta: 0.15 # spatio temporal balance parameter
+      beta_growth: 2.0
+      beta_max: 0.5
       max_iter: 50
       tol_no_change: 5
       objective_tol_rel: 1e-5

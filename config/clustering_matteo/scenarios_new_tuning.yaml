@@ -18,7 +18,7 @@
 # {init} = bal oppure full
 # {beta} = valore di beta
 
-gtb-0.15-900-bal-0.15:
+gtb-0.15-900-bal-0.05:
   clustering:
     geotemporal:
       reducer:
@@ -28,7 +28,9 @@ gtb-0.15-900-bal-0.15:
         init_mode: "balanced"
         init_nodes: null
         init_days: null
-        beta: 0.15
+        beta: 0.05
+        beta_growth: 2.0
+        beta_max: 0.5
         max_iter: 50
         tol_no_change: 5
         objective_tol_rel: 1e-5
@@ -37,7 +39,28 @@ gtb-0.15-900-bal-0.15:
         kmedoids_max_iter: 100
         random_state: 0
 
-gtb-0.10-900-bal-0.15:
+gtb-0-900-bal-0.05:
+  clustering:
+    geotemporal:
+      reducer:
+        lambda_ts: 0
+        normalize: "zscore"
+        max_total_steps: 900
+        init_mode: "balanced"
+        init_nodes: null
+        init_days: null
+        beta: 0.05
+        beta_growth: 2.0
+        beta_max: 0.5
+        max_iter: 50
+        tol_no_change: 5
+        objective_tol_rel: 1e-5
+        verbose: true
+        norm_q: 0.95
+        kmedoids_max_iter: 100
+        random_state: 0
+
+gtb-0.10-900-bal-0.05:
   clustering:
     geotemporal:
       reducer:
@@ -47,7 +70,9 @@ gtb-0.10-900-bal-0.15:
         init_mode: "balanced"
         init_nodes: null
         init_days: null
-        beta: 0.15
+        beta: 0.05
+        beta_growth: 2.0
+        beta_max: 0.5
         max_iter: 50
         tol_no_change: 5
         objective_tol_rel: 1e-5
@@ -56,7 +81,7 @@ gtb-0.10-900-bal-0.15:
         kmedoids_max_iter: 100
         random_state: 0
 
-gtb-0.05-900-bal-0.15:
+gtb-0.05-900-bal-0.05:
   clustering:
     geotemporal:
       reducer:
@@ -66,7 +91,9 @@ gtb-0.05-900-bal-0.15:
         init_mode: "balanced"
         init_nodes: null
         init_days: null
-        beta: 0.15
+        beta: 0.05
+        beta_growth: 2.0
+        beta_max: 0.5
         max_iter: 50
         tol_no_change: 5
         objective_tol_rel: 1e-5
@@ -75,7 +102,7 @@ gtb-0.05-900-bal-0.15:
         kmedoids_max_iter: 100
         random_state: 0
 
-gtb-0.15-90-bal-0.15:
+gtb-0.15-90-bal-0.05:
   clustering:
     geotemporal:
       reducer:
@@ -86,6 +113,8 @@ gtb-0.15-90-bal-0.15:
         init_nodes: null
         init_days: null
         beta: 0.05
+        beta_growth: 2.0
+        beta_max: 0.5
         max_iter: 50
         tol_no_change: 5
         objective_tol_rel: 1e-5
@@ -94,45 +123,7 @@ gtb-0.15-90-bal-0.15:
         kmedoids_max_iter: 100
         random_state: 0
 
-gtb-0.15-900-bal-0.30:
-  clustering:
-    geotemporal:
-      reducer:
-        lambda_ts: 0.15
-        normalize: "zscore"
-        max_total_steps: 900
-        init_mode: "balanced"
-        init_nodes: null
-        init_days: null
-        beta: 0.30
-        max_iter: 50
-        tol_no_change: 5
-        objective_tol_rel: 1e-5
-        verbose: true
-        norm_q: 0.95
-        kmedoids_max_iter: 100
-        random_state: 0
-
-gtb-0.15-900-bal-0.50:
-  clustering:
-    geotemporal:
-      reducer:
-        lambda_ts: 0.15
-        normalize: "zscore"
-        max_total_steps: 900
-        init_mode: "balanced"
-        init_nodes: null
-        init_days: null
-        beta: 0.50
-        max_iter: 50
-        tol_no_change: 5
-        objective_tol_rel: 1e-5
-        verbose: true
-        norm_q: 0.95
-        kmedoids_max_iter: 100
-        random_state: 0
-
-gtb-0.15-900-full-0.15:
+gtb-0.15-900-full-0.05:
   clustering:
     geotemporal:
       reducer:
@@ -142,7 +133,9 @@ gtb-0.15-900-full-0.15:
         init_mode: "full"
         init_nodes: null
         init_days: null
-        beta: 0.15
+        beta: 0.05
+        beta_growth: 2.0
+        beta_max: 0.5
         max_iter: 50
         tol_no_change: 5
         objective_tol_rel: 1e-5
@@ -151,7 +144,7 @@ gtb-0.15-900-full-0.15:
         kmedoids_max_iter: 100
         random_state: 0
 
-gtb-0.15-1600-full-0.15:
+gtb-0.15-1600-full-0.05:
   clustering:
     geotemporal:
       reducer:
@@ -161,7 +154,9 @@ gtb-0.15-1600-full-0.15:
         init_mode: "full"
         init_nodes: null
         init_days: null
-        beta: 0.15
+        beta: 0.05
+        beta_growth: 2.0
+        beta_max: 0.5
         max_iter: 50
         tol_no_change: 5
         objective_tol_rel: 1e-5
@@ -170,7 +165,7 @@ gtb-0.15-1600-full-0.15:
         kmedoids_max_iter: 100
         random_state: 0
 
-gtb-0.60-900-bal-0.15:
+gtb-0.60-900-bal-0.05:
   clustering:
     geotemporal:
       reducer:
@@ -180,7 +175,9 @@ gtb-0.60-900-bal-0.15:
         init_mode: "balanced"
         init_nodes: null
         init_days: null
-        beta: 0.15
+        beta: 0.05
+        beta_growth: 2.0
+        beta_max: 0.5
         max_iter: 50
         tol_no_change: 5
         objective_tol_rel: 1e-5

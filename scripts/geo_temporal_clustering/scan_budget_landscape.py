@@ -49,7 +49,7 @@ from scripts.geo_temporal_clustering.core import (
 
 NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/clustering_new_algorithm_tuning/gtb-0.15-900-bal-0.05/networks/base_s_adm_elec_Gt.nc")
 
-OUT_DIR = Path("resources/geotemporal_clustering_scan/900_band_0.15")
+OUT_DIR = Path("resources/geotemporal_clustering_scan/900_band_0.05_norma1_load2")
 
 # Main scan parameters
 TARGET_BUDGET = 900
@@ -93,9 +93,9 @@ WIND_WEIGHT_BY = "p_nom"
 # - exact feature name, e.g. "load_mean"
 # - attribute prefix, e.g. "load", "pv_cf", "wind_cf"
 FEATURE_WEIGHTS_CFG = {
-    # "load": 1.0,
-    # "pv_cf": 1.0,
-    # "wind_cf": 1.0,
+    "load": 2.0,
+    "pv_cf": 1.0,
+    "wind_cf": 1.0,
 }
 
 # Supported: None, "none", "mean_load", "peak_load"
@@ -103,14 +103,15 @@ NODE_WEIGHTS_MODE = None
 
 # Reducer parameters
 REDUCER_BASE_CFG = {
-    "lambda_ts": 0.15,
+    "lambda_ts": 0.05,
     "normalize": "zscore",
     "max_total_steps": TARGET_BUDGET,
+    "loss_norm": "l1",
     "beta": 0.05,
-    "beta_growth": 2.0,
-    "beta_max": 0.5,
+    "beta_growth": 1.5,
+    "beta_max": 0.7,
     "max_iter": 50,
-    "tol_no_change": 5,
+    "tol_no_change": 7,
     "objective_tol_rel": 1e-5,
     "verbose": False,
     "norm_q": 0.95,

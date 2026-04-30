@@ -20,11 +20,11 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "clustering_new_algorithm_tuning"
+  prefix: "reference_nuts3"
   name: all
   scenarios:
     enable: true
-    file: config/clustering_matteo/scenarios_new_tuning.yaml
+    file: config/clustering_matteo/scenarios_validation.yaml
   disable_progressbar: false
   shared_resources:
     policy: false
@@ -1106,7 +1106,7 @@ clustering:
 
     objective:
       feature_weights:
-        load: 1.0
+        load: 2.0
         pv_cf: 1.0
         wind_cf: 1.0
       node_weights: "mean_load"   # "mean_load", "peak_load", or "none"
@@ -1116,7 +1116,7 @@ clustering:
       fixed_nodes: 30
       fixed_days: 20
 
-      lambda_ts: 0.5
+      lambda_ts: 0.05
       normalize: "zscore"
       max_total_steps: 900
       init_mode: "balanced"       # "balanced" or "full" balanced -> nearly sqrt total; full from total

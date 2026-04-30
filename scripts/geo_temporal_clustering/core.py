@@ -860,12 +860,17 @@ def weighted_reconstruction_loss(
     *,
     feature_weights: Optional[np.ndarray] = None,
     node_loss_weights: Optional[np.ndarray] = None,
+    loss_norm: Literal["l1", "l2_squared"] = "l2_squared",
 ) -> float:
     """
     Weighted reconstruction loss on X[N,D,F].
 
-    The loss is:
+    Supported losses:
+    - "l2_squared":
         sum_n w_n * sum_f w_f * sum_d (X - X_rec)^2
+
+    - "l1":
+        sum_n w_n * sum_f w_f * sum_d |X - X_rec|
 
     Feature weights and node weights are internally normalized to have mean 1.
     """
@@ -876,7 +881,13 @@ def weighted_reconstruction_loss(
         raise ValueError("X and X_rec must have the same shape.")
 
     N, _, F = X.shape
-    err2 = (X - X_rec) ** 2
+
+    if loss_norm == "l2_squared":
+        err = (X - X_rec) ** 2
+    elif loss_norm == "l1":
+        err = np.abs(X - X_rec)
+    else:
+        raise ValueError("loss_norm must be either 'l1' or 'l2_squared'.")
 
     if feature_weights is None:
         wf = np.ones(F, dtype=float)
@@ -898,9 +909,10 @@ def weighted_reconstruction_loss(
             raise ValueError("node_loss_weights must be non-negative.")
         wn = wn / (wn.mean() + 1e-12)
 
-    err2 = err2 * wf[None, None, :]
-    err2 = err2.sum(axis=(1, 2))
-    return float(np.sum(wn * err2))
+    err = err * wf[None, None, :]
+    err = err.sum(axis=(1, 2))
+
+    return float(np.sum(wn * err))
 
 
 class AlternatingSpatioTemporalReducer:
@@ -928,6 +940,10 @@ class AlternatingSpatioTemporalReducer:
         lambda_ts: float = 0.85,
         normalize: Literal["zscore", "minmax"] = "zscore",
         max_total_steps: int = 144,
+        reduction_mode: Literal["budget", "fixed_pair"] = "budget",
+        fixed_nodes: Optional[int] = None,
+        fixed_days: Optional[int] = None,
+        loss_norm: Literal["l1", "l2_squared"] = "l2_squared",
         init_mode: Literal["balanced", "full"] = "balanced",
         init_nodes: Optional[int] = None,
         init_days: Optional[int] = None,
@@ -950,6 +966,10 @@ class AlternatingSpatioTemporalReducer:
         region_name_col: str = "name",
         feature_weights: Optional[np.ndarray] = None,
     ):
+        self.reduction_mode = str(reduction_mode)
+        self.fixed_nodes = None if fixed_nodes is None else int(fixed_nodes)
+        self.fixed_days = None if fixed_days is None else int(fixed_days)
+
         self.lambda_ts = float(lambda_ts)
         self.normalize = normalize
         self.max_total_steps = int(max_total_steps)
@@ -964,6 +984,7 @@ class AlternatingSpatioTemporalReducer:
         self.objective_tol_rel = float(objective_tol_rel)
         self.verbose = bool(verbose)
         self.norm_q = float(norm_q)
+        self.loss_norm = str(loss_norm)
 
         self.use_pca_days = bool(use_pca_days)
         self.pca_days_n_components = pca_days_n_components
@@ -1097,6 +1118,7 @@ class AlternatingSpatioTemporalReducer:
             X_rec,
             feature_weights=self.feature_weights,
             node_loss_weights=node_loss_weights,
+            loss_norm=self.loss_norm,
         )
 
         return dict(
@@ -1228,6 +1250,98 @@ class AlternatingSpatioTemporalReducer:
             node_loss_weights = np.asarray(node_weights, dtype=float)
             if node_loss_weights.shape != (N,):
                 raise ValueError("node_weights must have shape (N,).")
+
+        # ------------------------------------------------------------------
+        # Fixed-pair mode: solve exactly one (K_nodes, K_days) configuration
+        # ------------------------------------------------------------------
+
+        if self.reduction_mode == "fixed_pair":
+            K_nodes = int(self.fixed_nodes)
+            K_days = int(self.fixed_days)
+
+            if K_nodes < 1 or K_nodes > N:
+                raise ValueError(
+                    f"fixed_nodes must be in [1, {N}], got {K_nodes}."
+                )
+            if K_days < 1 or K_days > D:
+                raise ValueError(
+                    f"fixed_days must be in [1, {D}], got {K_days}."
+                )
+
+            rep_days_seed = np.arange(D, dtype=int)
+            rep_weights_seed = np.ones(D, dtype=int)
+
+            if K_nodes == N and K_days == D:
+                current_solution = dict(
+                    K_nodes=int(N),
+                    K_days=int(D),
+                    labels_nodes=np.arange(N, dtype=int),
+                    labels_days=np.arange(D, dtype=int),
+                    rep_nodes=np.arange(N, dtype=int),
+                    rep_node_weights=np.ones(N, dtype=int),
+                    rep_days=np.arange(D, dtype=int),
+                    rep_weights=np.ones(D, dtype=int),
+                    objective=0.0,
+                    day_pca_info=dict(use_pca=False),
+                    total_steps=int(N * D),
+                )
+            else:
+                current_solution = self._solve_for_pair(
+                    Xn,
+                    D_geo_n,
+                    rep_days_seed,
+                    rep_weights_seed,
+                    K_nodes,
+                    K_days,
+                    node_loss_weights=node_loss_weights,
+                )
+
+            history = [
+                dict(
+                    iter=0,
+                    phase="fixed_pair",
+                    status="accepted_fixed_pair",
+                    K_nodes=int(current_solution["K_nodes"]),
+                    K_days=int(current_solution["K_days"]),
+                    total_steps=int(current_solution["total_steps"]),
+                    objective=float(current_solution["objective"]),
+                )
+            ]
+
+            evaluations = [
+                dict(
+                    iter=0,
+                    phase="fixed_pair",
+                    move_type="fixed_pair",
+                    K_nodes=int(current_solution["K_nodes"]),
+                    K_days=int(current_solution["K_days"]),
+                    total_steps=int(current_solution["total_steps"]),
+                    objective=float(current_solution["objective"]),
+                )
+            ]
+
+            if self.verbose:
+                print(
+                    "[Fixed pair] "
+                    f"K_nodes={current_solution['K_nodes']} | "
+                    f"K_days={current_solution['K_days']} | "
+                    f"steps={current_solution['total_steps']} | "
+                    f"objective={current_solution['objective']:.6e}"
+                )
+
+            return ReductionResult(
+                labels_nodes=current_solution["labels_nodes"].astype(int),
+                labels_days=current_solution["labels_days"].astype(int),
+                rep_nodes=current_solution["rep_nodes"].astype(int),
+                rep_node_weights=current_solution["rep_node_weights"].astype(int),
+                rep_days=current_solution["rep_days"].astype(int),
+                rep_weights=current_solution["rep_weights"].astype(int),
+                history=history,
+                evaluations=evaluations,
+                day_pca_info=current_solution["day_pca_info"],
+                objective=float(current_solution["objective"]),
+                region_membership=None,
+            )
 
         target_budget = min(self.max_total_steps, N * D)
 

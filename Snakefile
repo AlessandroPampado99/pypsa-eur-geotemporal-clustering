@@ -375,10 +375,37 @@ rule sync_dry:
         rsync -uvarh --no-g {params.cluster}/logs . -n || echo "No logs directory, skipping rsync"
         """
 
+def electric_gt_expanded_network_targets():
+    """
+    Return GT expanded-network markers only for electricity-only opts containing 'Gt'.
+
+    This forces the DAG to go through:
+    geo_temporal_cluster_network -> solve_network_gt -> expand_gt_optimized_network
+
+    If no GT opts are present, return an empty list so the standard workflow
+    remains unchanged.
+    """
+    gt_opts = [opts for opts in config["scenario"].get("opts", []) if "Gt" in str(opts)]
+
+    if not gt_opts:
+        return []
+
+    gt_scenario = dict(config["scenario"])
+    gt_scenario["opts"] = gt_opts
+
+    return expand(
+        RESULTS + "networks/.base_s_{clusters}_elec_{opts}_expanded_gt.done",
+        run=config["run"]["name"],
+        **gt_scenario,
+    )
+
 rule all_electric:
     input:
         # 1) solved electricity networks (whatever solve_elec_networks already collects)
         rules.solve_elec_networks.input,
+
+        # 1b) GT clustering targets, only if opts contains 'Gt'
+        electric_gt_expanded_network_targets(),
 
         # 2) base maps (già nel tuo postprocess, safe)
         expand(resources("maps/power-network.pdf"), run=config["run"]["name"]),

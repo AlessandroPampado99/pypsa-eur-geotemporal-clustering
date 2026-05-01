@@ -1376,6 +1376,132 @@ def _attach_seasonal_storage_results(n: pypsa.Network) -> None:
             n.stores_t_full_e.shape,
         )
 
+def _has_gt_expansion_outputs(snakemake) -> bool:
+    """
+    Return True if the current rule declares the auxiliary GT expansion outputs.
+    """
+    return all(
+        key in snakemake.output.keys()
+        for key in [
+            "full_timeline",
+            "storage_units_t_full_soc",
+            "stores_t_full_e",
+        ]
+    )
+
+
+def _build_fallback_full_timeline_from_days_assignment(days_assignment_path: str | Path) -> pd.DataFrame:
+    """
+    Build a fallback full timeline with T+1 rows from days_assignment.csv.
+
+    The expanded network script expects a full-year timeline, not the clustered
+    snapshot timeline.
+    """
+    df = pd.read_csv(days_assignment_path)
+    df.columns = [c.strip() for c in df.columns]
+
+    cols = {c.lower(): c for c in df.columns}
+    day_candidates = ["day", "day_index", "original_day", "day_in_year", "d"]
+
+    day_col = next((cols[c] for c in day_candidates if c in cols), None)
+
+    if day_col is None:
+        raise ValueError(
+            "Cannot infer full timeline length from days_assignment.csv. "
+            f"Expected one of {day_candidates}, got columns: {list(df.columns)}"
+        )
+
+    day_vals = df[day_col].to_numpy()
+
+    if day_vals.min() == 1:
+        day_vals = day_vals - 1
+
+    n_days = int(day_vals.max() + 1)
+
+    rows = []
+    t = 0
+    for day in range(n_days):
+        for hour in range(24):
+            rows.append(
+                {
+                    "t": t,
+                    "day": int(day),
+                    "hour": int(hour),
+                }
+            )
+            t += 1
+
+    rows.append(
+        {
+            "t": t,
+            "day": int(n_days),
+            "hour": 0,
+        }
+    )
+
+    return pd.DataFrame(rows).set_index("t")
+
+
+def _write_gt_expansion_outputs(n: pypsa.Network, snakemake) -> None:
+    """
+    Write auxiliary files required by expand_gt_optimized_network.
+
+    These outputs are only written when the current Snakemake rule declares them,
+    i.e. for solve_network_gt.
+    """
+    if not _has_gt_expansion_outputs(snakemake):
+        return
+
+    logger.info("Writing GT expansion auxiliary outputs.")
+
+    # Attach seasonal-storage full-length results if available in the solved model.
+    _attach_seasonal_storage_results(n)
+
+    # Full timeline
+    if hasattr(n, "full_timeline"):
+        full_timeline = n.full_timeline.copy()
+    else:
+        days_assignment_path = snakemake.input.get("days_assignment", None)
+        if days_assignment_path is None:
+            raise ValueError(
+                "solve_network_gt declares GT expansion outputs, but "
+                "snakemake.input.days_assignment is missing."
+            )
+        full_timeline = _build_fallback_full_timeline_from_days_assignment(
+            days_assignment_path
+        )
+
+    full_timeline.to_csv(snakemake.output.full_timeline)
+
+    expected_len = len(full_timeline)
+
+    # StorageUnit full SOC
+    if hasattr(n, "storage_units_t_full_soc"):
+        storage_units_t_full_soc = n.storage_units_t_full_soc.copy()
+        storage_units_t_full_soc.index.name = "t"
+    else:
+        storage_units_t_full_soc = pd.DataFrame(index=range(expected_len))
+        storage_units_t_full_soc.index.name = "t"
+
+    storage_units_t_full_soc.to_csv(snakemake.output.storage_units_t_full_soc)
+
+    # Store full energy
+    if hasattr(n, "stores_t_full_e"):
+        stores_t_full_e = n.stores_t_full_e.copy()
+        stores_t_full_e.index.name = "t"
+    else:
+        stores_t_full_e = pd.DataFrame(index=range(expected_len))
+        stores_t_full_e.index.name = "t"
+
+    stores_t_full_e.to_csv(snakemake.output.stores_t_full_e)
+
+    logger.info(
+        "GT expansion outputs written: timeline=%s, storage_units_soc=%s, stores_e=%s",
+        snakemake.output.full_timeline,
+        snakemake.output.storage_units_t_full_soc,
+        snakemake.output.stores_t_full_e,
+    )
+
 def check_objective_value(n: pypsa.Network, solving: dict) -> None:
     """
     Check if objective value matches expected value within tolerance.
@@ -1638,24 +1764,6 @@ if __name__ == "__main__":
 
             logger.info("Solving model...")
             status, condition = n.optimize.solve_model(**solve_kwargs)
-            _attach_seasonal_storage_results(n)
-            if hasattr(n, "storage_units_t_full_soc"):
-                out_soc = Path(str(snakemake.output.network)).with_name(
-                    Path(str(snakemake.output.network)).stem + "_storage_units_t_full_soc.csv"
-                )
-                n.storage_units_t_full_soc.to_csv(out_soc)
-
-            if hasattr(n, "full_timeline"):
-                out_timeline = Path(str(snakemake.output.network)).with_name(
-                    Path(str(snakemake.output.network)).stem + "_full_timeline.csv"
-                )
-                n.full_timeline.to_csv(out_timeline)
-
-            if hasattr(n, "stores_t_full_e"):
-                out_store = Path(str(snakemake.output.network)).with_name(
-                    Path(str(snakemake.output.network)).stem + "_stores_t_full_e.csv"
-                )
-                n.stores_t_full_e.to_csv(out_store)
 
         else:
             logger.info("Using iterative transmission expansion optimization...")
@@ -1695,6 +1803,8 @@ if __name__ == "__main__":
         logger.info(f"Labels:\n{labels}")
         n.model.print_infeasibilities()
         raise RuntimeError("Solving status 'infeasible'. Infeasibilities computed.")
+
+    _write_gt_expansion_outputs(n, snakemake)
 
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
     n.export_to_netcdf(snakemake.output.network)

@@ -224,8 +224,8 @@ def main() -> None:
 
     reducer = AlternatingSpatioTemporalReducer(
         reduction_mode=str(_cfg_get(r_cfg, "reduction_mode", "budget")),
-        fixed_nodes=float(_cfg_get(r_cfg, "fixed_nodes")),
-        fixed_days=float(_cfg_get(r_cfg, "fixed_days")),
+        fixed_nodes=float(_cfg_get(r_cfg, "fixed_nodes", 9)),
+        fixed_days=float(_cfg_get(r_cfg, "fixed_days", 30)),
         loss_norm=str(_cfg_get(r_cfg, "loss_norm", "l2_squared")),
         lambda_ts=float(_cfg_get(r_cfg, "lambda_ts", 0.5)),
         normalize=str(_cfg_get(r_cfg, "normalize", "zscore")),

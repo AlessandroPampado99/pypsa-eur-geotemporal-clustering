@@ -43,10 +43,21 @@ def classify_scan_type(
     reference_run: str,
     reference_n_nodes: int,
     reference_n_days: int,
+    config: dict[str, Any] | None = None,
 ) -> str:
     """Classify each run according to its location in the N-D resolution space."""
     if run_name == reference_run:
         return "complete"
+
+    total_steps = n_nodes * n_days
+
+    budget_cfg = (config or {}).get("budget_scan", {})
+    if budget_cfg.get("enabled", False):
+        min_total_steps = int(budget_cfg.get("min_total_steps", 0))
+        max_total_steps = int(budget_cfg.get("max_total_steps", 10**18))
+
+        if min_total_steps <= total_steps <= max_total_steps:
+            return "budget_scan"
 
     if n_days == reference_n_days and n_nodes != reference_n_nodes:
         return "nodes_scan"
@@ -120,6 +131,7 @@ def build_run_table(config: dict[str, Any]) -> pd.DataFrame:
             reference_run=reference_run,
             reference_n_nodes=reference_n_nodes,
             reference_n_days=reference_n_days,
+            config=config,
         )
         network_path = build_network_path(config, run_name)
 
@@ -128,6 +140,7 @@ def build_run_table(config: dict[str, Any]) -> pd.DataFrame:
                 "run": run_name,
                 "n_nodes": n_nodes,
                 "n_days": n_days,
+                "total_steps": n_nodes * n_days,
                 "scan_type": scan_type,
                 "network_path": str(network_path),
             }
@@ -138,12 +151,13 @@ def build_run_table(config: dict[str, Any]) -> pd.DataFrame:
     # Keep reference first, then sort by scan type and resolution.
     scan_order = {
         "complete": 0,
-        "nodes_scan": 1,
-        "days_scan": 2,
-        "mixed_scan": 3,
+        "budget_scan": 1,
+        "nodes_scan": 2,
+        "days_scan": 3,
+        "mixed_scan": 4,
     }
     df["_scan_order"] = df["scan_type"].map(scan_order).fillna(99)
-    df = df.sort_values(["_scan_order", "n_days", "n_nodes", "run"]).drop(columns="_scan_order")
+    df = df.sort_values(["_scan_order", "n_nodes", "n_days", "run"]).drop(columns="_scan_order")
 
     return df.reset_index(drop=True)
 

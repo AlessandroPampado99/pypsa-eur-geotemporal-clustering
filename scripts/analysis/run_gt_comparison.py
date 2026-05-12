@@ -132,13 +132,13 @@ def main() -> None:
     metrics_summary = add_reference_deltas(
         df=metrics_summary,
         reference_run=reference_run,
-        id_columns=["run", "n_nodes", "n_days", "scan_type", "network_path"],
+        id_columns=["run", "n_nodes", "n_days", "total_steps", "scan_type", "network_path"],
     )
 
     generation_by_carrier = add_reference_deltas(
         df=generation_by_carrier,
         reference_run=reference_run,
-        id_columns=["run", "n_nodes", "n_days", "scan_type", "component", "carrier"],
+        id_columns=["run", "n_nodes", "n_days", "total_steps", "scan_type", "component", "carrier"],
         value_column="value",
         group_columns=["component", "carrier"],
     )
@@ -150,6 +150,7 @@ def main() -> None:
             "run",
             "n_nodes",
             "n_days",
+            "total_steps",
             "scan_type",
             "component",
             "carrier",

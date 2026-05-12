@@ -1899,40 +1899,281 @@ def build_full_busmap(
     return pd.Series(mapping, name="busmap").reindex(n.buses.index.astype(str))
 
 
+def _aggregate_temporal_dataframe_by_representative_days(
+    df: pd.DataFrame,
+    *,
+    snapshots: pd.Index,
+    labels_days: np.ndarray,
+    rep_days: np.ndarray,
+    hours_per_day: int,
+    representation: Literal["medoid", "mean", "medoid_scaled"] = "medoid",
+    clip_bounds: Optional[Tuple[float, float]] = None,
+) -> pd.DataFrame:
+    """
+    Aggregate a time-dependent PyPSA DataFrame onto representative days.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Time-dependent table with snapshots on rows.
+    snapshots : pd.Index
+        Original full snapshot index.
+    labels_days : np.ndarray
+        Day cluster label for each original day. Shape: (D,).
+    rep_days : np.ndarray
+        Representative day index for each cluster label. Shape: (K,).
+    hours_per_day : int
+        Number of snapshots per day.
+    representation : {"medoid", "mean", "medoid_scaled"}
+        - "medoid": keep the original representative-day values.
+        - "mean": replace each representative day with the hourly mean
+          of all days assigned to its cluster.
+        - "medoid_scaled": keep the medoid shape but rescale it so that
+          the weighted cluster total matches the original cluster total.
+    clip_bounds : tuple[float, float] | None
+        Optional lower/upper clipping bounds, useful for per-unit profiles.
+
+    Returns
+    -------
+    pd.DataFrame
+        Aggregated table indexed by the representative-day snapshots.
+    """
+    if df is None or df.empty:
+        return df
+
+    if len(df.index) != len(snapshots):
+        return df
+
+    labels_days = np.asarray(labels_days, dtype=int)
+    rep_days = np.asarray(rep_days, dtype=int)
+
+    T = len(snapshots)
+    if T % hours_per_day != 0:
+        raise ValueError(
+            f"Snapshots length {T} is not divisible by hours_per_day={hours_per_day}."
+        )
+
+    D = T // hours_per_day
+    if labels_days.shape != (D,):
+        raise ValueError(f"labels_days must have shape ({D},), got {labels_days.shape}.")
+
+    rep_days_sorted = np.sort(rep_days)
+    keep_idx = np.concatenate(
+        [
+            np.arange(d * hours_per_day, (d + 1) * hours_per_day)
+            for d in rep_days_sorted
+        ]
+    )
+    keep_snaps = snapshots[keep_idx]
+
+    if representation == "medoid":
+        out = df.reindex(index=keep_snaps).copy()
+        if clip_bounds is not None:
+            out = out.clip(lower=clip_bounds[0], upper=clip_bounds[1])
+        return out
+
+    out = df.reindex(index=keep_snaps).copy()
+
+    # Map representative day -> cluster label.
+    rep_day_to_cluster = {
+        int(rep_day): int(cluster_label)
+        for cluster_label, rep_day in enumerate(rep_days)
+    }
+
+    for rep_day in rep_days_sorted:
+        rep_day = int(rep_day)
+        cluster_label = rep_day_to_cluster[rep_day]
+
+        cluster_days = np.where(labels_days == cluster_label)[0].astype(int)
+        if len(cluster_days) == 0:
+            continue
+
+        for h in range(hours_per_day):
+            target_snap = snapshots[rep_day * hours_per_day + h]
+            source_snaps = snapshots[cluster_days * hours_per_day + h]
+
+            if representation == "mean":
+                out.loc[target_snap, :] = df.reindex(index=source_snaps).mean(axis=0)
+
+            elif representation == "medoid_scaled":
+                medoid_value = df.loc[target_snap, :].astype(float)
+                cluster_values = df.reindex(index=source_snaps).astype(float)
+
+                original_total = cluster_values.sum(axis=0)
+                medoid_total = medoid_value * float(len(cluster_days))
+
+                scale = pd.Series(1.0, index=df.columns, dtype=float)
+                nonzero = medoid_total.abs() > 1e-12
+
+                scale.loc[nonzero] = (
+                    original_total.loc[nonzero] / medoid_total.loc[nonzero]
+                )
+
+                # If the medoid is zero but the cluster is not, scaling cannot recover it.
+                # In that case, fall back to the cluster hourly mean.
+                fallback = (~nonzero) & (original_total.abs() > 1e-12)
+
+                new_value = medoid_value * scale
+                if fallback.any():
+                    new_value.loc[fallback] = cluster_values.loc[:, fallback].mean(axis=0)
+
+                out.loc[target_snap, :] = new_value
+
+            else:
+                raise ValueError(
+                    "representation must be one of: 'medoid', 'mean', 'medoid_scaled'."
+                )
+
+    if clip_bounds is not None:
+        out = out.clip(lower=clip_bounds[0], upper=clip_bounds[1])
+
+    return out
+
+
+def _iter_temporal_dataframes(n):
+    """
+    Yield common PyPSA time-dependent DataFrames that should be temporally aggregated.
+    """
+    candidates = [
+        ("generators_t", "p_max_pu", (0.0, 1.0)),
+        ("generators_t", "p_min_pu", (0.0, 1.0)),
+        ("generators_t", "p_set", None),
+        ("generators_t", "q_set", None),
+        ("generators_t", "marginal_cost", None),
+
+        ("loads_t", "p_set", None),
+        ("loads_t", "q_set", None),
+
+        ("storage_units_t", "inflow", None),
+        ("storage_units_t", "p_max_pu", (0.0, 1.0)),
+        ("storage_units_t", "p_min_pu", (0.0, 1.0)),
+        ("storage_units_t", "marginal_cost", None),
+
+        ("stores_t", "e_set", None),
+        ("stores_t", "p_set", None),
+        ("stores_t", "marginal_cost", None),
+
+        ("links_t", "p_set", None),
+        ("links_t", "p_max_pu", None),
+        ("links_t", "p_min_pu", None),
+        ("links_t", "efficiency", None),
+        ("links_t", "marginal_cost", None),
+
+        ("lines_t", "s_max_pu", (0.0, 1.0)),
+        ("transformers_t", "s_max_pu", (0.0, 1.0)),
+    ]
+
+    for container_name, attr_name, clip_bounds in candidates:
+        container = getattr(n, container_name, None)
+        if container is None:
+            continue
+
+        df = getattr(container, attr_name, None)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            yield container, attr_name, df, clip_bounds
+
+
 def apply_temporal_reduction(
     n,
     *,
     rep_days: np.ndarray,
     rep_weights: np.ndarray,
+    labels_days: Optional[np.ndarray] = None,
     hours_per_day: int = 24,
+    representation: Literal["medoid", "mean", "medoid_scaled"] = "medoid",
 ) -> None:
     """
-    In-place temporal reduction:
-    - Keep only snapshots corresponding to representative days.
-    - Multiply snapshot_weightings by the representative day weight (cardinality).
+    In-place temporal reduction.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify.
+    rep_days : np.ndarray
+        Representative day indices.
+    rep_weights : np.ndarray
+        Representative day weights, normally cluster sizes.
+    labels_days : np.ndarray | None
+        Day cluster labels for all original days. Required for "mean" and
+        "medoid_scaled" representations.
+    hours_per_day : int
+        Number of snapshots per day.
+    representation : {"medoid", "mean", "medoid_scaled"}
+        Temporal representation strategy.
+
+    Notes
+    -----
+    - "medoid" keeps the current behaviour.
+    - "mean" replaces each representative day with the cluster hourly mean.
+    - "medoid_scaled" preserves medoid shape but rescales cluster totals.
     """
     rep_days = np.asarray(rep_days, dtype=int)
     rep_weights = np.asarray(rep_weights, dtype=float)
 
-    snaps = n.snapshots
+    snaps = n.snapshots.copy()
     T = len(snaps)
     if T % hours_per_day != 0:
-        raise ValueError(f"Snapshots length {T} not divisible by hours_per_day={hours_per_day}.")
+        raise ValueError(
+            f"Snapshots length {T} not divisible by hours_per_day={hours_per_day}."
+        )
+
     D = T // hours_per_day
 
     if rep_days.min() < 0 or rep_days.max() >= D:
         raise ValueError("rep_days out of range.")
 
+    if representation not in {"medoid", "mean", "medoid_scaled"}:
+        raise ValueError(
+            "representation must be one of: 'medoid', 'mean', 'medoid_scaled'."
+        )
+
+    if representation != "medoid" and labels_days is None:
+        raise ValueError(
+            "labels_days must be provided when representation is "
+            f"'{representation}'."
+        )
+
+    if labels_days is not None:
+        labels_days = np.asarray(labels_days, dtype=int)
+        if labels_days.shape != (D,):
+            raise ValueError(f"labels_days must have shape ({D},), got {labels_days.shape}.")
+
     rep_days_sorted = np.sort(rep_days)
     keep_idx = np.concatenate(
-        [np.arange(d * hours_per_day, (d + 1) * hours_per_day) for d in rep_days_sorted]
+        [
+            np.arange(d * hours_per_day, (d + 1) * hours_per_day)
+            for d in rep_days_sorted
+        ]
     )
     keep_snaps = snaps[keep_idx]
 
-    day_weight_map = {int(d): float(w) for d, w in zip(rep_days, rep_weights)}
+    # Aggregate time-dependent data before changing the snapshot index.
+    aggregated_tables = []
+    for container, attr_name, df, clip_bounds in _iter_temporal_dataframes(n):
+        if labels_days is None:
+            agg = df.reindex(index=keep_snaps).copy()
+        else:
+            agg = _aggregate_temporal_dataframe_by_representative_days(
+                df,
+                snapshots=snaps,
+                labels_days=labels_days,
+                rep_days=rep_days,
+                hours_per_day=hours_per_day,
+                representation=representation,
+                clip_bounds=clip_bounds,
+            )
+
+        aggregated_tables.append((container, attr_name, agg))
+
+    day_weight_map = {
+        int(d): float(w)
+        for d, w in zip(rep_days, rep_weights)
+    }
+
     multipliers = []
     for d in rep_days_sorted:
         multipliers.extend([day_weight_map[int(d)]] * hours_per_day)
+
     mult = pd.Series(np.asarray(multipliers, dtype=float), index=keep_snaps)
 
     if getattr(n, "snapshot_weightings", None) is not None and not n.snapshot_weightings.empty:
@@ -1951,3 +2192,7 @@ def apply_temporal_reduction(
             n.snapshot_weightings[col].astype(float)
             * mult.reindex(n.snapshots).to_numpy()
         )
+
+    # Write aggregated time-dependent tables back after set_snapshots.
+    for container, attr_name, agg in aggregated_tables:
+        setattr(container, attr_name, agg.reindex(index=n.snapshots))

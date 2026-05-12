@@ -221,6 +221,9 @@ def main() -> None:
                 f"Unsupported node_weights setting: {node_weights_cfg}. "
                 "Supported: None, 'none', 'mean_load', 'peak_load'."
             )
+        
+    temporal_cfg = _cfg_get(cfg, "temporal", {}) or {}
+    temporal_representation = str(_cfg_get(temporal_cfg, "representation", "medoid"))
 
     reducer = AlternatingSpatioTemporalReducer(
         reduction_mode=str(_cfg_get(r_cfg, "reduction_mode", "budget")),
@@ -321,7 +324,9 @@ def main() -> None:
         nc,
         rep_days=result.rep_days,
         rep_weights=result.rep_weights,
+        labels_days=result.labels_days,
         hours_per_day=hours_per_day,
+        representation=temporal_representation,
     )
 
     # ---------------------------------------------------------------------

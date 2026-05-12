@@ -37,6 +37,16 @@ def get_plot_column(metric: str, value_kind: str) -> str:
 
     raise ValueError(f"Unsupported value_kind: {value_kind}")
 
+def export_plot_data(
+    plot_df: pd.DataFrame,
+    plots_dir: Path,
+    filename: str,
+) -> None:
+    """Export the exact dataframe used for a plot."""
+    data_dir = plots_dir / "plot_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    plot_df.to_csv(data_dir / f"{filename}.csv", index=False)
+
 
 def get_ylabel(metric: str, value_kind: str) -> str:
     """Build a readable y-axis label."""
@@ -69,9 +79,19 @@ def plot_metric_2d_scans(
     """
     Plot 2D scan curves.
 
-    For nodes_scan: x = n_nodes.
-    For days_scan: x = n_days.
-    For mixed_scan: currently skipped in 2D because there is no single scan direction.
+    For nodes_scan:
+        x = n_nodes
+        color = n_days
+
+    For days_scan:
+        x = n_days
+        color = n_nodes
+
+    For budget_scan:
+        x = n_nodes
+        color = n_days
+
+    Scans with fewer than two non-reference points are skipped.
     """
     column = get_plot_column(metric, value_kind)
     if column not in df.columns:
@@ -79,34 +99,135 @@ def plot_metric_2d_scans(
         return
 
     scan_specs = [
-        ("nodes_scan", "n_nodes", "Number of nodes"),
-        ("days_scan", "n_days", "Number of days"),
+        {
+            "scan_type": "nodes_scan",
+            "x_col": "n_nodes",
+            "color_col": "n_days",
+            "x_label": "Number of nodes",
+            "color_label": "Number of days",
+            "title_suffix": "spatial scan",
+            "include_complete": True,
+        },
+        {
+            "scan_type": "days_scan",
+            "x_col": "n_days",
+            "color_col": "n_nodes",
+            "x_label": "Number of days",
+            "color_label": "Number of nodes",
+            "title_suffix": "temporal scan",
+            "include_complete": True,
+        },
+        {
+            "scan_type": "budget_scan",
+            "x_col": "n_nodes",
+            "color_col": "n_days",
+            "x_label": "Number of nodes",
+            "color_label": "Number of days",
+            "title_suffix": "constant geo-temporal budget",
+            "include_complete": False,
+        },
     ]
 
-    for scan_type, x_col, x_label in scan_specs:
-        plot_df = df[df["scan_type"].isin([scan_type, "complete"])].copy()
+    reference_df = df[df["scan_type"] == "complete"].copy()
+    reference_value = None
+    if not reference_df.empty and column in reference_df.columns:
+        reference_value = float(reference_df.iloc[0][column])
+
+    for spec in scan_specs:
+        scan_type = spec["scan_type"]
+        x_col = spec["x_col"]
+        color_col = spec["color_col"]
+        x_label = spec["x_label"]
+        color_label = spec["color_label"]
+        title_suffix = spec["title_suffix"]
+        include_complete = spec["include_complete"]
+
+        non_reference_df = df[df["scan_type"] == scan_type].copy()
+
+        # Skip meaningless 2D scans with only one actual reduced point.
+        if len(non_reference_df) < 2:
+            print(
+                f"[INFO] Skipping {scan_type} 2D plot for '{metric}' "
+                f"because it has fewer than two non-reference points."
+            )
+            continue
+
+        if include_complete:
+            plot_df = pd.concat([reference_df, non_reference_df], ignore_index=True)
+        else:
+            plot_df = non_reference_df
+
+        plot_df = plot_df.dropna(subset=[column, x_col, color_col])
         plot_df = plot_df.sort_values(x_col)
 
         if plot_df.empty:
             continue
 
-        fig, ax = plt.subplots(figsize=(7.0, 4.5))
+        filename = sanitize_filename(f"{metric}_{value_kind}_2d_{scan_type}")
 
-        ax.plot(plot_df[x_col], plot_df[column], marker="o", linewidth=1.8)
+        export_plot_data(
+            plot_df=plot_df,
+            plots_dir=plots_dir,
+            filename=filename,
+        )
+
+        fig, ax = plt.subplots(figsize=(7.6, 4.9))
+
+        ax.plot(
+            plot_df[x_col],
+            plot_df[column],
+            linewidth=1.4,
+            alpha=0.55,
+            zorder=1,
+        )
+
+        scatter = ax.scatter(
+            plot_df[x_col],
+            plot_df[column],
+            c=plot_df[color_col],
+            s=65,
+            edgecolors="black",
+            linewidths=0.4,
+            zorder=2,
+        )
+
+        cbar = fig.colorbar(scatter, ax=ax)
+        cbar.set_label(color_label, fontweight="bold")
+
+        if scan_type == "budget_scan":
+            for _, row in plot_df.iterrows():
+                ax.annotate(
+                    f"d={int(row['n_days'])}",
+                    xy=(row[x_col], row[column]),
+                    xytext=(4, 4),
+                    textcoords="offset points",
+                    fontsize=7,
+                )
+
         ax.set_xlabel(x_label, fontweight="bold")
         ax.set_ylabel(get_ylabel(metric, value_kind), fontweight="bold")
-        ax.set_title(f"{metric.replace('_', ' ')} - {scan_type}", fontweight="bold")
+        ax.set_title(
+            f"{metric.replace('_', ' ')} - {title_suffix}",
+            fontweight="bold",
+        )
         ax.grid(True, alpha=0.3)
 
         if value_kind in {"delta", "relative_delta"}:
             ax.axhline(0.0, linewidth=1.0, linestyle="--")
+        elif reference_value is not None and scan_type == "budget_scan":
+            ax.axhline(
+                reference_value,
+                linewidth=1.0,
+                linestyle="--",
+                label="complete",
+            )
+            ax.legend(frameon=False)
 
         if value_kind == "relative_delta":
             ax.yaxis.set_major_formatter(lambda x, pos: f"{x * 100:.1f}%")
 
         fig.tight_layout()
 
-        filename = sanitize_filename(f"{metric}_{value_kind}_2d_{scan_type}")
         save_figure(fig, plots_dir / filename, config)
         plt.close(fig)
 
@@ -124,22 +245,53 @@ def plot_metric_3d(
         print(f"[WARNING] Column '{column}' not found. Skipping 3D plot.")
         return
 
-    plot_df = df[["run", "n_nodes", "n_days", column]].copy()
-    plot_df = plot_df.dropna(subset=[column])
+    plot_df = df[["run", "n_nodes", "n_days", column, "scan_type"]].copy()
+    plot_df = plot_df.dropna(subset=[column, "n_nodes", "n_days"])
+    plot_df = plot_df.sort_values(["n_nodes", "n_days"])
 
     if plot_df.empty:
         return
 
-    fig = plt.figure(figsize=(7.5, 5.8))
+    filename = sanitize_filename(f"{metric}_{value_kind}_3d")
+
+    export_plot_data(
+        plot_df=plot_df,
+        plots_dir=plots_dir,
+        filename=filename,
+    )
+
+    fig = plt.figure(figsize=(8.2, 6.2))
     ax = fig.add_subplot(111, projection="3d")
 
-    ax.scatter(
+    scatter = ax.scatter(
         plot_df["n_nodes"],
         plot_df["n_days"],
         plot_df[column],
-        s=45,
-        depthshade=True,
+        c=plot_df[column],
+        s=65,
+        edgecolors="black",
+        linewidths=0.4,
+        depthshade=False,
     )
+
+    cbar = fig.colorbar(scatter, ax=ax, shrink=0.72, pad=0.12)
+    cbar.set_label(get_ylabel(metric, value_kind), fontweight="bold")
+
+    reference_df = plot_df[plot_df["scan_type"] == "complete"]
+    if not reference_df.empty:
+        ref = reference_df.iloc[0]
+        ax.scatter(
+            [ref["n_nodes"]],
+            [ref["n_days"]],
+            [ref[column]],
+            s=120,
+            marker="*",
+            edgecolors="black",
+            linewidths=0.7,
+            depthshade=False,
+            label="complete",
+        )
+        ax.legend(frameon=False)
 
     for _, row in plot_df.iterrows():
         ax.text(
@@ -155,12 +307,14 @@ def plot_metric_3d(
     ax.set_zlabel(get_ylabel(metric, value_kind), fontweight="bold")
     ax.set_title(f"{metric.replace('_', ' ')} - 3D scan", fontweight="bold")
 
+    # This angle makes z differences more visible for budget-scan points.
+    ax.view_init(elev=24, azim=-55)
+
     if value_kind == "relative_delta":
         ax.zaxis.set_major_formatter(lambda x, pos: f"{x * 100:.1f}%")
 
     fig.tight_layout()
 
-    filename = sanitize_filename(f"{metric}_{value_kind}_3d")
     save_figure(fig, plots_dir / filename, config)
     plt.close(fig)
 
@@ -169,14 +323,22 @@ def order_runs_for_heatmap(df: pd.DataFrame) -> list[str]:
     """Return a stable run order for heatmaps."""
     scan_order = {
         "complete": 0,
-        "nodes_scan": 1,
-        "days_scan": 2,
-        "mixed_scan": 3,
+        "budget_scan": 1,
+        "nodes_scan": 2,
+        "days_scan": 3,
+        "mixed_scan": 4,
     }
 
-    tmp = df[["run", "scan_type", "n_nodes", "n_days"]].drop_duplicates().copy()
+    columns = ["run", "scan_type", "n_nodes", "n_days"]
+    if "total_steps" in df.columns:
+        columns.append("total_steps")
+
+    tmp = df[columns].drop_duplicates().copy()
     tmp["_scan_order"] = tmp["scan_type"].map(scan_order).fillna(99)
-    tmp = tmp.sort_values(["_scan_order", "n_days", "n_nodes", "run"])
+
+    sort_columns = ["_scan_order", "n_nodes", "n_days", "run"]
+    tmp = tmp.sort_values(sort_columns)
+
     return tmp["run"].tolist()
 
 

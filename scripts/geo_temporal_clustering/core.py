@@ -914,6 +914,117 @@ def weighted_reconstruction_loss(
 
     return float(np.sum(wn * err))
 
+def _candidate_summary(candidate_solutions: List[dict]) -> dict:
+    """
+    Build a compact summary of the candidate alternatives tested at one iteration.
+
+    This is meant for history rows. The detailed candidate-by-candidate log is
+    still stored in evaluations.
+    """
+    if not candidate_solutions:
+        return dict(
+            n_candidates=0,
+            candidate_pairs="",
+            candidate_objectives="",
+            best_candidate_K_nodes=None,
+            best_candidate_K_days=None,
+            best_candidate_total_steps=None,
+            best_candidate_move_type=None,
+            best_candidate_objective=None,
+        )
+
+    ordered = sorted(candidate_solutions, key=lambda s: float(s["objective"]))
+    best = ordered[0]
+
+    candidate_pairs = ";".join(
+        f"{int(c['K_nodes'])}x{int(c['K_days'])}:{str(c.get('move_type', ''))}"
+        for c in candidate_solutions
+    )
+
+    candidate_objectives = ";".join(
+        f"{int(c['K_nodes'])}x{int(c['K_days'])}:{float(c['objective']):.12e}"
+        for c in candidate_solutions
+    )
+
+    return dict(
+        n_candidates=int(len(candidate_solutions)),
+        candidate_pairs=candidate_pairs,
+        candidate_objectives=candidate_objectives,
+        best_candidate_K_nodes=int(best["K_nodes"]),
+        best_candidate_K_days=int(best["K_days"]),
+        best_candidate_total_steps=int(best["total_steps"]),
+        best_candidate_move_type=str(best.get("move_type", "")),
+        best_candidate_objective=float(best["objective"]),
+    )
+
+
+def _append_candidate_evaluations(
+    evaluations: List[dict],
+    *,
+    iter_id: int,
+    phase: str,
+    current_solution: dict,
+    candidate_solutions: List[dict],
+    beta: Optional[float] = None,
+    accepted_solution: Optional[dict] = None,
+) -> None:
+    """
+    Append detailed candidate evaluations for one iteration.
+
+    Each row contains both:
+    - the current pair from which the candidate was generated;
+    - the candidate pair being tested;
+    - whether the candidate was accepted.
+    """
+    if not candidate_solutions:
+        return
+
+    ordered = sorted(candidate_solutions, key=lambda s: float(s["objective"]))
+    rank_by_pair = {
+        (int(c["K_nodes"]), int(c["K_days"])): rank
+        for rank, c in enumerate(ordered, start=1)
+    }
+
+    accepted_pair = None
+    if accepted_solution is not None:
+        accepted_pair = (
+            int(accepted_solution["K_nodes"]),
+            int(accepted_solution["K_days"]),
+        )
+
+    for cand in candidate_solutions:
+        pair = (int(cand["K_nodes"]), int(cand["K_days"]))
+
+        row = dict(
+            iter=int(iter_id),
+            phase=str(phase),
+            move_type=str(cand.get("move_type", "")),
+
+            current_K_nodes=int(current_solution["K_nodes"]),
+            current_K_days=int(current_solution["K_days"]),
+            current_total_steps=int(current_solution["total_steps"]),
+            current_objective=float(current_solution["objective"]),
+
+            candidate_K_nodes=int(cand["K_nodes"]),
+            candidate_K_days=int(cand["K_days"]),
+            candidate_total_steps=int(cand["total_steps"]),
+            candidate_objective=float(cand["objective"]),
+
+            # Backward-compatible columns
+            K_nodes=int(cand["K_nodes"]),
+            K_days=int(cand["K_days"]),
+            total_steps=int(cand["total_steps"]),
+            objective=float(cand["objective"]),
+
+            candidate_rank=int(rank_by_pair[pair]),
+            accepted=bool(accepted_pair is not None and pair == accepted_pair),
+            n_candidates=int(len(candidate_solutions)),
+        )
+
+        if beta is not None:
+            row["beta"] = float(beta)
+
+        evaluations.append(row)
 
 class AlternatingSpatioTemporalReducer:
     """
@@ -1170,28 +1281,97 @@ class AlternatingSpatioTemporalReducer:
         *,
         beta_current: float,
     ) -> List[Tuple[int, int, str]]:
-        """Generate candidate pairs around the current one while staying under the target budget."""
+        """
+        Generate boundary-aware candidate pairs around the current solution.
+
+        The search radius is controlled by beta_current. Larger beta values
+        generate coarser moves, smaller beta values generate finer moves.
+
+        Candidates always satisfy:
+        - 1 <= K_nodes <= N
+        - 1 <= K_days <= D
+        - K_nodes * K_days <= target_budget
+
+        Boundary logic:
+        - If nodes cannot be increased because K_nodes == N, the algorithm
+          can only keep nodes fixed or move toward fewer nodes with more days.
+        - If days cannot be increased because K_days == D, the algorithm
+          can only keep days fixed or move toward fewer days with more nodes.
+        """
         candidates: List[Tuple[int, int, str]] = []
 
         beta_current = float(beta_current)
         if beta_current <= 0.0:
             raise ValueError("beta_current must be > 0.")
 
-        # More space, less time
-        kn_up = min(N, max(K_nodes + 1, int(np.ceil(K_nodes * (1.0 + beta_current)))))
-        kd_for_kn_up = max(1, min(D, target_budget // kn_up))
-        if (kn_up, kd_for_kn_up) != (K_nodes, K_days):
-            candidates.append((kn_up, kd_for_kn_up, "more_space"))
+        current_pair = (int(K_nodes), int(K_days))
 
-        # More time, less space
-        kd_up = min(D, max(K_days + 1, int(np.ceil(K_days * (1.0 + beta_current)))))
-        kn_for_kd_up = max(1, min(N, target_budget // kd_up))
-        if (kn_for_kd_up, kd_up) != (K_nodes, K_days):
-            candidates.append((kn_for_kd_up, kd_up, "more_time"))
+        def add_candidate(kn: int, kd: int, move_type: str) -> None:
+            """Add a feasible candidate if it is new and different from current."""
+            kn = int(max(1, min(N, kn)))
+            kd = int(max(1, min(D, kd)))
 
-        # Remove duplicates while preserving order
+            if kn * kd > target_budget:
+                return
+
+            pair = (kn, kd)
+            if pair == current_pair:
+                return
+
+            candidates.append((kn, kd, str(move_type)))
+
+        # ------------------------------------------------------------------
+        # Candidate 1: move toward more spatial detail.
+        #
+        # If K_nodes can increase, increase nodes and adapt days to stay
+        # inside the budget.
+        # ------------------------------------------------------------------
+        if K_nodes < N:
+            kn_target = int(np.ceil(K_nodes * (1.0 + beta_current)))
+            kn_new = min(N, max(K_nodes + 1, kn_target))
+            kd_new = max(1, min(D, target_budget // kn_new))
+
+            add_candidate(kn_new, kd_new, "more_space")
+
+        # ------------------------------------------------------------------
+        # Candidate 2: move toward more temporal detail.
+        #
+        # If K_days can increase, increase days and adapt nodes to stay
+        # inside the budget.
+        # ------------------------------------------------------------------
+        if K_days < D:
+            kd_target = int(np.ceil(K_days * (1.0 + beta_current)))
+            kd_new = min(D, max(K_days + 1, kd_target))
+            kn_new = max(1, min(N, target_budget // kd_new))
+
+            add_candidate(kn_new, kd_new, "more_time")
+
+        # ------------------------------------------------------------------
+        # Candidate 3: boundary fill with fixed nodes.
+        #
+        # Useful when K_nodes is already at the maximum. Example:
+        # current = 96 nodes, 20 days, target budget = 2880.
+        # Then 96 nodes and 30 days is feasible and should be tested.
+        # ------------------------------------------------------------------
+        if K_nodes == N:
+            kd_fill = min(D, target_budget // K_nodes)
+            if kd_fill > K_days:
+                add_candidate(K_nodes, kd_fill, "fill_time_at_max_space")
+
+        # ------------------------------------------------------------------
+        # Candidate 4: boundary fill with fixed days.
+        #
+        # Symmetric case when K_days is already at the maximum.
+        # ------------------------------------------------------------------
+        if K_days == D:
+            kn_fill = min(N, target_budget // K_days)
+            if kn_fill > K_nodes:
+                add_candidate(kn_fill, K_days, "fill_space_at_max_time")
+
+        # Remove duplicates while preserving order.
         seen = set()
         unique_candidates: List[Tuple[int, int, str]] = []
+
         for kn, kd, move_type in candidates:
             key = (int(kn), int(kd))
             if key in seen:
@@ -1525,34 +1705,86 @@ class AlternatingSpatioTemporalReducer:
         # ------------------------------------------------------------------
         beta_current = float(self.beta)
 
+                # ------------------------------------------------------------------
+        # Phase 2: local search within the feasible region
+        # ------------------------------------------------------------------
+        beta_min = float(self.beta)
+        beta_start = float(self.beta_max)
+
+        if beta_min <= 0.0:
+            raise ValueError("beta must be > 0.")
+        if beta_start <= 0.0:
+            raise ValueError("beta_max must be > 0.")
+        if beta_start < beta_min:
+            raise ValueError(
+                "For descending-beta search, beta_max must be >= beta. "
+                f"Got beta_max={beta_start}, beta={beta_min}."
+            )
+        if self.beta_growth <= 1.0:
+            raise ValueError(
+                "For descending-beta search, beta_growth must be > 1. "
+                f"Got beta_growth={self.beta_growth}."
+            )
+
+        beta_current = beta_start
+        tested_transitions = set()
+
         while it_feasible < self.max_iter:
             current_budget = int(current_solution["total_steps"])
             current_obj = float(current_solution["objective"])
+            beta_used = float(beta_current)
 
             visited_pairs = set()
+
             candidate_pairs = self._candidate_pairs_rebalance(
                 int(current_solution["K_nodes"]),
                 int(current_solution["K_days"]),
                 target_budget,
                 N,
                 D,
-                beta_current=beta_current,
+                beta_current=beta_used,
             )
 
-            # Drop already tested / duplicated pairs for the current solution
+            # Drop duplicated pairs and transitions already tested from the current solution.
             filtered_candidate_pairs = []
+            seen_pairs_this_iter = set()
+
+            current_pair = (
+                int(current_solution["K_nodes"]),
+                int(current_solution["K_days"]),
+            )
+
             for cand_kn, cand_kd, move_type in candidate_pairs:
-                key = (int(cand_kn), int(cand_kd))
-                if key == (int(current_solution["K_nodes"]), int(current_solution["K_days"])):
+                candidate_pair = (int(cand_kn), int(cand_kd))
+
+                if candidate_pair == current_pair:
                     continue
-                if key in visited_pairs:
+
+                if candidate_pair in seen_pairs_this_iter:
                     continue
-                visited_pairs.add(key)
+
+                transition_key = (
+                    int(current_solution["K_nodes"]),
+                    int(current_solution["K_days"]),
+                    int(cand_kn),
+                    int(cand_kd),
+                )
+
+                if transition_key in tested_transitions:
+                    continue
+
+                seen_pairs_this_iter.add(candidate_pair)
+                tested_transitions.add(transition_key)
+
                 filtered_candidate_pairs.append((cand_kn, cand_kd, move_type))
 
             if len(filtered_candidate_pairs) == 0:
                 no_improve_counter += 1
-                beta_current = min(self.beta_max, beta_current * self.beta_growth)
+
+                beta_current = max(
+                    beta_min,
+                    beta_used / float(self.beta_growth),
+                )
 
                 history.append(
                     dict(
@@ -1563,25 +1795,31 @@ class AlternatingSpatioTemporalReducer:
                         K_days=int(current_solution["K_days"]),
                         total_steps=int(current_solution["total_steps"]),
                         objective=float(current_solution["objective"]),
-                        beta=float(beta_current),
+                        beta=float(beta_used),
+                        next_beta=float(beta_current),
                         no_change=int(no_improve_counter),
                     )
                 )
 
                 if self.verbose:
                     print(
-                        f"[No new pairs] beta updated to {beta_current:.6f} | "
+                        f"[No new pairs] beta={beta_used:.6f} | "
+                        f"next_beta={beta_current:.6f} | "
                         f"no_change={no_improve_counter}"
                     )
 
                 it_global += 1
                 it_feasible += 1
 
-                if no_improve_counter >= self.tol_no_change or beta_current >= self.beta_max:
+                # Stop only if the finest beta has already been tested.
+                if (
+                    no_improve_counter >= self.tol_no_change
+                    or beta_used <= beta_min + 1e-12
+                ):
                     if self.verbose:
                         print(
                             f"[Converged] No new/improving feasible candidates. "
-                            f"beta={beta_current:.6f}, no_change={no_improve_counter}"
+                            f"beta={beta_used:.6f}, no_change={no_improve_counter}"
                         )
                     break
 
@@ -1591,6 +1829,7 @@ class AlternatingSpatioTemporalReducer:
             seed_weights = current_solution["rep_weights"]
 
             candidate_solutions = []
+
             for cand_kn, cand_kd, move_type in filtered_candidate_pairs:
                 cand = self._solve_for_pair(
                     Xn,
@@ -1604,38 +1843,38 @@ class AlternatingSpatioTemporalReducer:
                 cand["move_type"] = move_type
                 candidate_solutions.append(cand)
 
-                evaluations.append(
-                    dict(
-                        iter=int(it_global + 1),
-                        phase="feasible_search",
-                        move_type=str(move_type),
-                        K_nodes=int(cand["K_nodes"]),
-                        K_days=int(cand["K_days"]),
-                        total_steps=int(cand["total_steps"]),
-                        objective=float(cand["objective"]),
-                        beta=float(beta_current),
-                    )
-                )
-
                 if self.verbose:
                     print(
-                        f"    candidate={move_type:>14s} | "
+                        f"    candidate={move_type:>24s} | "
                         f"K_nodes={cand['K_nodes']} | "
                         f"K_days={cand['K_days']} | "
                         f"steps={cand['total_steps']} | "
                         f"objective={cand['objective']:.6e} | "
-                        f"beta={beta_current:.6f}"
+                        f"beta={beta_used:.6f}"
                     )
 
             best_candidate = min(candidate_solutions, key=lambda s: float(s["objective"]))
             best_obj = float(best_candidate["objective"])
+            candidate_info = _candidate_summary(candidate_solutions)
 
             rel_improvement = (current_obj - best_obj) / max(abs(current_obj), 1e-12)
 
             if best_obj < current_obj and rel_improvement > self.objective_tol_rel:
+                accepted_solution = best_candidate
+                _append_candidate_evaluations(
+                    evaluations,
+                    iter_id=int(it_global + 1),
+                    phase="feasible_search",
+                    current_solution=current_solution,
+                    candidate_solutions=candidate_solutions,
+                    beta=float(beta_used),
+                    accepted_solution=accepted_solution,
+                )
                 current_solution = best_candidate
                 no_improve_counter = 0
-                beta_current = float(self.beta)
+
+                # After an accepted move, restart from the widest radius.
+                beta_current = beta_start
 
                 it_global += 1
                 it_feasible += 1
@@ -1645,12 +1884,29 @@ class AlternatingSpatioTemporalReducer:
                         iter=int(it_global),
                         phase="feasible_search",
                         status="accepted_feasible",
+
+                        previous_K_nodes=int(current_pair[0]),
+                        previous_K_days=int(current_pair[1]),
+                        previous_total_steps=int(current_pair[0] * current_pair[1]),
+                        previous_objective=float(current_obj),
+
                         K_nodes=int(current_solution["K_nodes"]),
                         K_days=int(current_solution["K_days"]),
                         total_steps=int(current_solution["total_steps"]),
                         objective=float(current_solution["objective"]),
-                        beta=float(beta_current),
+
+                        beta=float(beta_used),
+                        next_beta=float(beta_current),
                         no_change=int(no_improve_counter),
+
+                        **candidate_info,
+
+                        accepted_candidate_K_nodes=int(current_solution["K_nodes"]),
+                        accepted_candidate_K_days=int(current_solution["K_days"]),
+                        accepted_candidate_total_steps=int(current_solution["total_steps"]),
+                        accepted_candidate_move_type=str(best_candidate.get("move_type", "")),
+                        accepted_candidate_objective=float(current_solution["objective"]),
+                        rel_improvement=float(rel_improvement),
                     )
                 )
 
@@ -1663,26 +1919,49 @@ class AlternatingSpatioTemporalReducer:
                         f"objective={current_solution['objective']:.6e} | "
                         f"beta reset to {beta_current:.6f}"
                     )
+
             else:
                 no_improve_counter += 1
-                beta_current = min(self.beta_max, beta_current * self.beta_growth)
+
+                _append_candidate_evaluations(
+                    evaluations,
+                    iter_id=int(it_global + 1),
+                    phase="feasible_search",
+                    current_solution=current_solution,
+                    candidate_solutions=candidate_solutions,
+                    beta=float(beta_used),
+                    accepted_solution=None,
+                )
+
+                # No improvement: refine the local search radius.
+                beta_current = max(
+                    beta_min,
+                    beta_used / float(self.beta_growth),
+                )
 
                 history.append(
                     dict(
                         iter=int(it_global + 1),
                         phase="feasible_search",
                         status="no_improvement",
+
                         K_nodes=int(current_solution["K_nodes"]),
                         K_days=int(current_solution["K_days"]),
                         total_steps=int(current_solution["total_steps"]),
                         objective=float(current_solution["objective"]),
-                        beta=float(beta_current),
+
+                        beta=float(beta_used),
+                        next_beta=float(beta_current),
                         no_change=int(no_improve_counter),
-                        best_candidate_K_nodes=int(best_candidate["K_nodes"]),
-                        best_candidate_K_days=int(best_candidate["K_days"]),
-                        best_candidate_total_steps=int(best_candidate["total_steps"]),
-                        best_candidate_move_type=str(best_candidate.get("move_type", "")),
-                        best_candidate_objective=float(best_obj),
+
+                        **candidate_info,
+
+                        accepted_candidate_K_nodes=None,
+                        accepted_candidate_K_days=None,
+                        accepted_candidate_total_steps=None,
+                        accepted_candidate_move_type=None,
+                        accepted_candidate_objective=None,
+
                         rel_improvement=float(rel_improvement),
                     )
                 )
@@ -1692,18 +1971,23 @@ class AlternatingSpatioTemporalReducer:
                         f"[No improvement] best_candidate={best_obj:.6e} | "
                         f"current={current_obj:.6e} | "
                         f"rel_improvement={rel_improvement:.3e} | "
-                        f"beta updated to {beta_current:.6f} | "
+                        f"beta={beta_used:.6f} | "
+                        f"next_beta={beta_current:.6f} | "
                         f"no_change={no_improve_counter}"
                     )
 
                 it_global += 1
                 it_feasible += 1
 
-                if no_improve_counter >= self.tol_no_change or beta_current >= self.beta_max:
+                # Stop only after testing the finest beta.
+                if (
+                    no_improve_counter >= self.tol_no_change
+                    or beta_used <= beta_min + 1e-12
+                ):
                     if self.verbose:
                         print(
                             f"[Converged] No relevant improvement. "
-                            f"beta={beta_current:.6f}, no_change={no_improve_counter}"
+                            f"beta={beta_used:.6f}, no_change={no_improve_counter}"
                         )
                     break
 

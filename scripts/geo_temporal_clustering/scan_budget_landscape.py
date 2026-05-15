@@ -49,7 +49,7 @@ from scripts.geo_temporal_clustering.core import (
 
 NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/clustering_new_algorithm_tuning/gtb-0.15-900-bal-0.05/networks/base_s_adm_elec_Gt.nc")
 
-OUT_DIR = Path("resources/geotemporal_clustering_scan/900_band_0.05_norma1_load2")
+OUT_DIR = Path("resources/geotemporal_clustering_scan/beta_opposite_1")
 
 # Main scan parameters
 TARGET_BUDGET = 900
@@ -106,10 +106,10 @@ REDUCER_BASE_CFG = {
     "lambda_ts": 0.05,
     "normalize": "zscore",
     "max_total_steps": TARGET_BUDGET,
-    "loss_norm": "l1",
+    "loss_norm": "l2_squared",
     "beta": 0.05,
     "beta_growth": 1.5,
-    "beta_max": 0.7,
+    "beta_max": 1.0,
     "max_iter": 50,
     "tol_no_change": 7,
     "objective_tol_rel": 1e-5,
@@ -213,6 +213,280 @@ def build_scan_pairs(
     pairs = sorted(set(pairs), key=lambda x: (x[0] * x[1], x[0], x[1]), reverse=True)
     return pairs
 
+def _first_existing_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    """
+    Return the first column from candidates that exists in df.
+    """
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _json_safe_value(value: Any) -> Any:
+    """
+    Convert numpy/pandas scalar values to JSON-safe Python objects.
+    """
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+
+    if isinstance(value, (np.floating,)):
+        return float(value)
+
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+
+    return value
+
+
+def enrich_history_with_evaluation_alternatives(
+    history: pd.DataFrame,
+    evaluations: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Add compact candidate-alternative information to the reducer history.
+
+    The detailed candidate-level data remain in scan_evaluations.csv.
+    This function adds, for each history iteration, a compact summary such as:
+    - number of candidates tested;
+    - list of candidate pairs;
+    - best candidate pair;
+    - best candidate objective;
+    - rank of the accepted/current pair among candidates, when inferable.
+
+    The function is intentionally tolerant to column-name differences in
+    reducer.history and reducer.evaluations.
+    """
+    if history.empty or evaluations.empty:
+        return history
+
+    h = history.copy()
+    e = evaluations.copy()
+
+    iter_col_h = _first_existing_column(
+        h,
+        ["iteration", "iter", "it", "step", "iteration_id"],
+    )
+    iter_col_e = _first_existing_column(
+        e,
+        ["iteration", "iter", "it", "step", "iteration_id"],
+    )
+
+    cand_nodes_col = _first_existing_column(
+        e,
+        [
+            "candidate_K_nodes",
+            "candidate_k_nodes",
+            "cand_K_nodes",
+            "cand_k_nodes",
+            "new_K_nodes",
+            "new_k_nodes",
+            "K_nodes_new",
+            "k_nodes_new",
+            "K_nodes",
+            "k_nodes",
+        ],
+    )
+    cand_days_col = _first_existing_column(
+        e,
+        [
+            "candidate_K_days",
+            "candidate_k_days",
+            "cand_K_days",
+            "cand_k_days",
+            "new_K_days",
+            "new_k_days",
+            "K_days_new",
+            "k_days_new",
+            "K_days",
+            "k_days",
+        ],
+    )
+    cand_obj_col = _first_existing_column(
+        e,
+        [
+            "candidate_objective",
+            "objective_candidate",
+            "new_objective",
+            "objective_new",
+            "objective",
+            "loss",
+            "score",
+        ],
+    )
+
+    hist_nodes_col = _first_existing_column(
+        h,
+        [
+            "K_nodes",
+            "k_nodes",
+            "current_K_nodes",
+            "current_k_nodes",
+            "final_K_nodes",
+            "final_k_nodes",
+        ],
+    )
+    hist_days_col = _first_existing_column(
+        h,
+        [
+            "K_days",
+            "k_days",
+            "current_K_days",
+            "current_k_days",
+            "final_K_days",
+            "final_k_days",
+        ],
+    )
+
+    accepted_col = _first_existing_column(
+        e,
+        ["accepted", "is_accepted", "chosen", "selected"],
+    )
+
+    required = [iter_col_h, iter_col_e, cand_nodes_col, cand_days_col]
+    if any(col is None for col in required):
+        missing = {
+            "history_iteration_col": iter_col_h,
+            "evaluations_iteration_col": iter_col_e,
+            "candidate_nodes_col": cand_nodes_col,
+            "candidate_days_col": cand_days_col,
+        }
+        print(
+            ">>> Warning: cannot enrich scan_history.csv with candidate alternatives. "
+            f"Missing/inferred columns: {missing}"
+        )
+        return h
+
+    group_cols_e = ["run_id", iter_col_e] if "run_id" in e.columns else [iter_col_e]
+    group_cols_h = ["run_id", iter_col_h] if "run_id" in h.columns else [iter_col_h]
+
+    rows = []
+
+    for key, g in e.groupby(group_cols_e, dropna=False):
+        g = g.copy()
+
+        if cand_obj_col is not None:
+            g = g.sort_values(cand_obj_col, ascending=True, kind="mergesort")
+        else:
+            g = g.sort_values([cand_nodes_col, cand_days_col], kind="mergesort")
+
+        candidate_records = []
+        candidate_pairs = []
+
+        for _, row in g.iterrows():
+            kn = _json_safe_value(row[cand_nodes_col])
+            kd = _json_safe_value(row[cand_days_col])
+
+            rec = {
+                "K_nodes": kn,
+                "K_days": kd,
+                "total_steps": None if kn is None or kd is None else int(kn * kd),
+            }
+
+            if cand_obj_col is not None:
+                rec["objective"] = _json_safe_value(row[cand_obj_col])
+
+            candidate_records.append(rec)
+            candidate_pairs.append(f"{kn}x{kd}")
+
+        best = candidate_records[0] if candidate_records else {}
+
+        accepted_rank = None
+        accepted_K_nodes = None
+        accepted_K_days = None
+        accepted_objective = None
+
+        if accepted_col is not None:
+            accepted_mask = g[accepted_col].astype(bool)
+            if accepted_mask.any():
+                accepted_row = g.loc[accepted_mask].iloc[0]
+                accepted_K_nodes = _json_safe_value(accepted_row[cand_nodes_col])
+                accepted_K_days = _json_safe_value(accepted_row[cand_days_col])
+                if cand_obj_col is not None:
+                    accepted_objective = _json_safe_value(accepted_row[cand_obj_col])
+
+                for rank, rec in enumerate(candidate_records, start=1):
+                    if (
+                        rec["K_nodes"] == accepted_K_nodes
+                        and rec["K_days"] == accepted_K_days
+                    ):
+                        accepted_rank = rank
+                        break
+
+        out = {
+            "n_candidates": int(len(g)),
+            "candidate_pairs": ";".join(candidate_pairs),
+            "candidate_details_json": json.dumps(candidate_records),
+            "best_candidate_K_nodes": best.get("K_nodes"),
+            "best_candidate_K_days": best.get("K_days"),
+            "best_candidate_total_steps": best.get("total_steps"),
+            "best_candidate_objective": best.get("objective"),
+            "accepted_candidate_K_nodes": accepted_K_nodes,
+            "accepted_candidate_K_days": accepted_K_days,
+            "accepted_candidate_objective": accepted_objective,
+            "accepted_candidate_rank": accepted_rank,
+        }
+
+        if isinstance(key, tuple):
+            for col, value in zip(group_cols_e, key):
+                out[col] = value
+        else:
+            out[group_cols_e[0]] = key
+
+        rows.append(out)
+
+    alt = pd.DataFrame(rows)
+
+    if alt.empty:
+        return h
+
+    # Align evaluation iteration column name to history iteration column name.
+    if iter_col_e != iter_col_h and iter_col_e in alt.columns:
+        alt = alt.rename(columns={iter_col_e: iter_col_h})
+
+    merge_cols = group_cols_h
+
+    h = h.merge(
+        alt,
+        on=merge_cols,
+        how="left",
+    )
+
+    # If the accepted candidate was not explicitly available in evaluations,
+    # infer its rank by matching the current history pair against candidate pairs.
+    if (
+        "accepted_candidate_rank" in h.columns
+        and hist_nodes_col is not None
+        and hist_days_col is not None
+    ):
+        for idx, row in h.iterrows():
+            if pd.notna(row.get("accepted_candidate_rank")):
+                continue
+
+            details = row.get("candidate_details_json")
+            if not isinstance(details, str) or not details:
+                continue
+
+            try:
+                candidates = json.loads(details)
+            except json.JSONDecodeError:
+                continue
+
+            current_kn = row.get(hist_nodes_col)
+            current_kd = row.get(hist_days_col)
+
+            for rank, rec in enumerate(candidates, start=1):
+                if rec.get("K_nodes") == current_kn and rec.get("K_days") == current_kd:
+                    h.at[idx, "accepted_candidate_rank"] = rank
+                    h.at[idx, "accepted_candidate_K_nodes"] = current_kn
+                    h.at[idx, "accepted_candidate_K_days"] = current_kd
+                    h.at[idx, "accepted_candidate_objective"] = rec.get("objective")
+                    break
+
+    return h
 
 def prepare_clustering_inputs(network_path: Path) -> dict:
     """
@@ -407,6 +681,9 @@ def run_one_reducer(
         evaluations.insert(2, "init_nodes", init_nodes)
         evaluations.insert(3, "init_days", init_days)
         evaluations.insert(4, "random_state", int(random_state))
+
+    if not history.empty and not evaluations.empty:
+        history = enrich_history_with_evaluation_alternatives(history, evaluations)
 
     return summary, history, evaluations
 

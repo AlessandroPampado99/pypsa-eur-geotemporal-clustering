@@ -1,7 +1,7 @@
 paths:
   root_dir: "/home/pampado/clustering/pypsa-eur"
-  runs_dir: "results/reference_nuts3"
-  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_900"
+  runs_dir: "results/reference_nuts3_lambda_0_medoid"
+  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_900_lambda_0_medoid"
 
 network:
   # Flexible template. Available placeholders:

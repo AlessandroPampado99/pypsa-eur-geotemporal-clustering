@@ -697,6 +697,36 @@ def _cluster_sizes_from_labels(labels: np.ndarray) -> np.ndarray:
         return np.zeros(0, dtype=int)
     return np.bincount(labels, minlength=int(labels.max()) + 1).astype(int)
 
+def _cluster_weight_sums_from_labels(
+    labels: np.ndarray,
+    node_weights: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Return cluster weights for contiguous labels.
+
+    If node_weights is None, this falls back to cluster cardinality.
+    Otherwise, each cluster weight is the sum of the initial node weights
+    assigned to that cluster.
+    """
+    labels = _relabel_contiguous(labels)
+
+    if labels.size == 0:
+        return np.zeros(0, dtype=float)
+
+    K = int(labels.max()) + 1
+
+    if node_weights is None:
+        return np.bincount(labels, minlength=K).astype(float)
+
+    w = np.asarray(node_weights, dtype=float)
+
+    if w.shape != labels.shape:
+        raise ValueError("node_weights must have the same shape as labels.")
+
+    if np.any(w < 0):
+        raise ValueError("node_weights must be non-negative.")
+
+    return np.bincount(labels, weights=w, minlength=K).astype(float)
 
 def _medoids_from_labels(D: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Return medoid indices and cluster sizes for a labeled partition."""
@@ -1179,6 +1209,7 @@ class AlternatingSpatioTemporalReducer:
         K_days: int,
         *,
         node_loss_weights: Optional[np.ndarray] = None,
+        node_cluster_weights: Optional[np.ndarray] = None,
     ) -> dict:
         """
         Solve one alternating step for a fixed pair (K_nodes, K_days).
@@ -1195,7 +1226,11 @@ class AlternatingSpatioTemporalReducer:
             random_state=self.random_state,
         )
         labels_nodes = _relabel_contiguous(labels_nodes)
-        rep_node_weights = _cluster_sizes_from_labels(labels_nodes)
+
+        rep_node_weights = _cluster_weight_sums_from_labels(
+            labels_nodes,
+            node_cluster_weights,
+        )
 
         X_rep_nodes = Xn[rep_nodes, :, :]
         D_day_raw, day_pca_info = build_day_distance(
@@ -1238,7 +1273,7 @@ class AlternatingSpatioTemporalReducer:
             labels_nodes=labels_nodes,
             labels_days=labels_days,
             rep_nodes=rep_nodes.astype(int),
-            rep_node_weights=rep_node_weights.astype(int),
+            rep_node_weights=rep_node_weights.astype(float),
             rep_days=rep_days.astype(int),
             rep_weights=rep_weights.astype(int),
             objective=float(objective),
@@ -1426,10 +1461,22 @@ class AlternatingSpatioTemporalReducer:
 
         if node_weights is None:
             node_loss_weights = None
+            node_cluster_weights = None
         else:
-            node_loss_weights = np.asarray(node_weights, dtype=float)
-            if node_loss_weights.shape != (N,):
+            node_cluster_weights = np.asarray(node_weights, dtype=float)
+
+            if node_cluster_weights.shape != (N,):
                 raise ValueError("node_weights must have shape (N,).")
+
+            if np.any(node_cluster_weights < 0):
+                raise ValueError("node_weights must be non-negative.")
+
+            if node_cluster_weights.sum() <= 0.0:
+                raise ValueError("node_weights must have positive total weight.")
+
+            # Same initial weights are used for the reconstruction loss.
+            # weighted_reconstruction_loss normalizes them internally to mean 1.
+            node_loss_weights = node_cluster_weights
 
         # ------------------------------------------------------------------
         # Fixed-pair mode: solve exactly one (K_nodes, K_days) configuration
@@ -1458,7 +1505,11 @@ class AlternatingSpatioTemporalReducer:
                     labels_nodes=np.arange(N, dtype=int),
                     labels_days=np.arange(D, dtype=int),
                     rep_nodes=np.arange(N, dtype=int),
-                    rep_node_weights=np.ones(N, dtype=int),
+                    rep_node_weights=(
+                        np.ones(N, dtype=float)
+                        if node_cluster_weights is None
+                        else node_cluster_weights.astype(float).copy()
+                    ),
                     rep_days=np.arange(D, dtype=int),
                     rep_weights=np.ones(D, dtype=int),
                     objective=0.0,
@@ -1474,6 +1525,7 @@ class AlternatingSpatioTemporalReducer:
                     K_nodes,
                     K_days,
                     node_loss_weights=node_loss_weights,
+                    node_cluster_weights=node_cluster_weights,
                 )
 
             history = [
@@ -1513,7 +1565,7 @@ class AlternatingSpatioTemporalReducer:
                 labels_nodes=current_solution["labels_nodes"].astype(int),
                 labels_days=current_solution["labels_days"].astype(int),
                 rep_nodes=current_solution["rep_nodes"].astype(int),
-                rep_node_weights=current_solution["rep_node_weights"].astype(int),
+                rep_node_weights=current_solution["rep_node_weights"].astype(float),
                 rep_days=current_solution["rep_days"].astype(int),
                 rep_weights=current_solution["rep_weights"].astype(int),
                 history=history,
@@ -1541,7 +1593,11 @@ class AlternatingSpatioTemporalReducer:
                 labels_nodes=np.arange(N, dtype=int),
                 labels_days=np.arange(D, dtype=int),
                 rep_nodes=np.arange(N, dtype=int),
-                rep_node_weights=np.ones(N, dtype=int),
+                rep_node_weights=(
+                    np.ones(N, dtype=float)
+                    if node_cluster_weights is None
+                    else node_cluster_weights.astype(float).copy()
+                ),
                 rep_days=np.arange(D, dtype=int),
                 rep_weights=np.ones(D, dtype=int),
                 objective=0.0,
@@ -1557,6 +1613,7 @@ class AlternatingSpatioTemporalReducer:
                 K_nodes,
                 K_days,
                 node_loss_weights=node_loss_weights,
+                node_cluster_weights=node_cluster_weights,
             )
 
         no_improve_counter = 0
@@ -1625,6 +1682,7 @@ class AlternatingSpatioTemporalReducer:
                     cand_kn,
                     cand_kd,
                     node_loss_weights=node_loss_weights,
+                    node_cluster_weights=node_cluster_weights,
                 )
                 cand["move_type"] = move_type
                 candidate_solutions.append(cand)
@@ -1839,6 +1897,7 @@ class AlternatingSpatioTemporalReducer:
                     cand_kn,
                     cand_kd,
                     node_loss_weights=node_loss_weights,
+                    node_cluster_weights=node_cluster_weights,
                 )
                 cand["move_type"] = move_type
                 candidate_solutions.append(cand)
@@ -2002,7 +2061,7 @@ class AlternatingSpatioTemporalReducer:
             labels_nodes=current_solution["labels_nodes"].astype(int),
             labels_days=current_solution["labels_days"].astype(int),
             rep_nodes=current_solution["rep_nodes"].astype(int),
-            rep_node_weights=current_solution["rep_node_weights"].astype(int),
+            rep_node_weights=current_solution["rep_node_weights"].astype(float),
             rep_days=current_solution["rep_days"].astype(int),
             rep_weights=current_solution["rep_weights"].astype(int),
             history=history,
@@ -2077,6 +2136,69 @@ def loads_by_bus_timeseries(n, buses: List[str]) -> pd.DataFrame:
 
     return out
 
+def electric_demand_weights_by_bus(
+    n,
+    buses: List[str],
+    *,
+    use_snapshot_weightings: bool = True,
+    normalization: Literal["none", "sum", "mean", "max"] = "mean",
+    fallback_to_uniform: bool = True,
+) -> np.ndarray:
+    """
+    Build node weights proportional to total electric demand per selected bus.
+
+    The returned weights are aligned with `buses`.
+
+    Normalization modes
+    -------------------
+    - "none": return absolute demand weights.
+    - "sum": weights sum to 1.
+    - "mean": weights have mean 1.
+    - "max": maximum weight is 1.
+    """
+    load_ts = loads_by_bus_timeseries(n, buses).astype(float)
+
+    if use_snapshot_weightings and getattr(n, "snapshot_weightings", None) is not None:
+        if not n.snapshot_weightings.empty and "objective" in n.snapshot_weightings.columns:
+            sw = n.snapshot_weightings.reindex(load_ts.index)["objective"].astype(float)
+            weights = load_ts.mul(sw, axis=0).sum(axis=0)
+        else:
+            weights = load_ts.sum(axis=0)
+    else:
+        weights = load_ts.sum(axis=0)
+
+    weights = weights.reindex(buses).fillna(0.0).astype(float)
+    values = weights.to_numpy(dtype=float)
+
+    if np.any(values < 0):
+        raise ValueError("Electric demand weights must be non-negative.")
+
+    total = float(values.sum())
+
+    if total <= 0.0:
+        if fallback_to_uniform:
+            values = np.ones(len(buses), dtype=float)
+        else:
+            raise ValueError(
+                "Total electric demand weight is zero. Cannot build demand-based node weights."
+            )
+
+    if normalization == "none":
+        return values
+
+    if normalization == "sum":
+        denom = float(values.sum())
+    elif normalization == "mean":
+        denom = float(values.mean())
+    elif normalization == "max":
+        denom = float(values.max())
+    else:
+        raise ValueError("normalization must be one of: 'none', 'sum', 'mean', 'max'.")
+
+    if denom <= 0.0:
+        return np.ones(len(buses), dtype=float)
+
+    return values / denom
 
 def cf_by_bus_timeseries(
     n,

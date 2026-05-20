@@ -1,7 +1,7 @@
 paths:
   root_dir: "/home/pampado/clustering/pypsa-eur"
-  runs_dir: "results/reference_nuts3_medoid"
-  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_900_medoid"
+  runs_dir: "results/reference_nuts3_mean_400"
+  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_400_mean"
 
 network:
   # Flexible template. Available placeholders:
@@ -15,35 +15,14 @@ reference:
   n_days: 365
 
 runs:
-  auto_discover: false
-  include:
-    - complete
-    - gtf-n2-d365
-    - gtf-n4-d200
-    - gtf-n6-d140
-    - gtf-n8-d100
-    - gtf-n10-d80
-    - gtf-n13-d66
-    - gtf-n16-d50
-    - gtf-n20-d40
-    - gtf-n25-d36
-    - gtf-n30-d30
-    - gtf-n36-d24
-    - gtf-n44-d18
-    - gtf-n50-d17
-    - gtf-n54-d16
-    - gtf-n68-d13
-    - gtf-n77-d11
-    - gtf-n81-d11
-    - gtf-n90-d11
-    - gtf-n94-d9
-    - gtf-n96-d8
+  auto_discover: true
+  include: []
   exclude: []
 
 budget_scan:
   enabled: true
-  min_total_steps: 700
-  max_total_steps: 900
+  min_total_steps: 380
+  max_total_steps: 420
 
 carriers:
   conventional:

@@ -36,6 +36,7 @@ from scripts.geo_temporal_clustering.core import (
     select_buses_from_loads,
     bus_coords_latlon,
     loads_by_bus_timeseries,
+    electric_demand_weights_by_bus,
     cf_by_bus_timeseries,
     build_full_busmap,
     apply_temporal_reduction,
@@ -196,22 +197,32 @@ def main() -> None:
     feature_weights = _build_feature_weights(feat_names, feature_weights_cfg)
 
     # ---------------------------------------------------------------------
-    # Optional node weights for the objective
+    # Optional node weights for spatial clustering and reconstruction loss
     # ---------------------------------------------------------------------
     node_weights = None
 
     if node_weights_cfg is not None:
         node_weights_mode = str(node_weights_cfg).lower()
 
-        if node_weights_mode == "mean_load":
+        if node_weights_mode in {"electric_demand", "total_load", "demand"}:
+            node_weights = electric_demand_weights_by_bus(
+                n,
+                base_buses,
+                use_snapshot_weightings=True,
+                normalization="mean",
+            )
+
+        elif node_weights_mode == "mean_load":
             if "load" not in data_hourly:
                 raise ValueError("node_weights='mean_load' requires load to be included in features.")
             node_weights = data_hourly["load"].mean(axis=1).astype(float)
+            node_weights = node_weights / (node_weights.mean() + 1e-12)
 
         elif node_weights_mode == "peak_load":
             if "load" not in data_hourly:
                 raise ValueError("node_weights='peak_load' requires load to be included in features.")
             node_weights = data_hourly["load"].max(axis=1).astype(float)
+            node_weights = node_weights / (node_weights.mean() + 1e-12)
 
         elif node_weights_mode == "none":
             node_weights = None
@@ -219,7 +230,8 @@ def main() -> None:
         else:
             raise ValueError(
                 f"Unsupported node_weights setting: {node_weights_cfg}. "
-                "Supported: None, 'none', 'mean_load', 'peak_load'."
+                "Supported: None, 'none', 'electric_demand', 'total_load', "
+                "'demand', 'mean_load', 'peak_load'."
             )
         
     temporal_cfg = _cfg_get(cfg, "temporal", {}) or {}
@@ -373,7 +385,7 @@ def main() -> None:
             "rep_lat": lat[result.rep_nodes.astype(int)],
             "rep_lon": lon[result.rep_nodes.astype(int)],
             "rep_node_cluster": np.arange(len(result.rep_nodes), dtype=int),
-            "cluster_size": result.rep_node_weights.astype(int),
+            "cluster_size": result.rep_node_weights.astype(float),
         }
     ).sort_values("rep_node_cluster")
     df_rep_nodes.to_csv(out_rep_nodes, index=False)

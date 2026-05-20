@@ -47,7 +47,7 @@ from scripts.geo_temporal_clustering.core import (
 # USER SETTINGS
 # =============================================================================
 
-NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/clustering_new_algorithm_tuning/gtb-0.15-900-bal-0.05/networks/base_s_adm_elec_Gt.nc")
+NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/reference_nuts3/complete/networks/base_s_adm_elec_.nc")
 
 OUT_DIR = Path("resources/geotemporal_clustering_scan/beta_opposite_1")
 

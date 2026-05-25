@@ -27,13 +27,15 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from gt_comparison.config import load_config
-from gt_comparison.io import build_run_table, load_network
+from gt_comparison.io import build_run_table, load_network, add_clustering_objectives
 from gt_comparison.metrics import collect_metrics_for_network
 from gt_comparison.postprocess import add_reference_deltas
 from gt_comparison.plotting import (
     plot_metric_2d_scans,
     plot_metric_3d,
     plot_capacity_heatmaps,
+    plot_budget_combined_relative_profiles,
+    plot_optimization_vs_clustering_objective,
 )
 
 
@@ -160,6 +162,11 @@ def main() -> None:
         group_columns=["component", "carrier", "attribute"],
     )
 
+    metrics_summary = add_clustering_objectives(
+        df=metrics_summary,
+        config=config,
+    )
+
     write_outputs(
         output_dir=output_dir,
         metrics_summary=metrics_summary,
@@ -209,6 +216,20 @@ def main() -> None:
                         plots_dir=plots_dir,
                         config=config,
                     )
+                    
+        if plot_config.get("make_budget_combined", True):
+            plot_budget_combined_relative_profiles(
+                df=metrics_summary,
+                plots_dir=plots_dir,
+                config=config,
+            )
+
+        if plot_config.get("make_objective_comparison", True):
+            plot_optimization_vs_clustering_objective(
+                df=metrics_summary,
+                plots_dir=plots_dir,
+                config=config,
+            )
 
         if plot_config.get("capacity_heatmaps", {}).get("enabled", True):
             plot_capacity_heatmaps(

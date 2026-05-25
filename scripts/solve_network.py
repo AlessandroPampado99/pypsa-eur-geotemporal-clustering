@@ -1248,13 +1248,23 @@ def extra_functionality(
     
     # --- GEO-TEMPORAL SEASONAL STORAGE (only for GT runs) ---
     geotemporal_cfg = getattr(n, "params", {}).get("geotemporal", {}) or {}
-    seasonal_storage_cfg = geotemporal_cfg.get("seasonal_storage", {}) or {}
 
+    seasonal_storage_cfg = geotemporal_cfg.get("seasonal_storage", {})
+    if seasonal_storage_cfg is None:
+        seasonal_storage_cfg = {}
+    elif isinstance(seasonal_storage_cfg, bool):
+        seasonal_storage_cfg = {"enable": seasonal_storage_cfg}
+    elif not isinstance(seasonal_storage_cfg, dict):
+        raise TypeError(
+            "'geotemporal.seasonal_storage' must be either a dictionary, "
+            f"a boolean, or None. Got {type(seasonal_storage_cfg).__name__}."
+        )
+
+    seasonal_storage_enabled = bool(seasonal_storage_cfg.get("enable", True))
     days_assignment_path = geotemporal_cfg.get("days_assignment")
     is_gt_run = bool(days_assignment_path)
 
-    if is_gt_run:
-        days_assignment_path = geotemporal_cfg['days_assignment']
+    if is_gt_run and seasonal_storage_enabled:
         if not days_assignment_path:
             raise ValueError(
                 "GT seasonal storage requires 'days_assignment' in n.params."
@@ -1264,7 +1274,8 @@ def extra_functionality(
 
         logger.info(
             "Activating seasonal-storage extra_functionality for GT run "
-            "(cyclic=%s).",
+            "(enabled=%s, cyclic=%s).",
+            seasonal_storage_enabled,
             cyclic,
         )
 
@@ -1278,6 +1289,14 @@ def extra_functionality(
             days_assignment_path=days_assignment_path,
             cyclic=cyclic,
         )
+
+    elif is_gt_run:
+        logger.info(
+            "Skipping seasonal-storage extra_functionality for GT run "
+            "because geotemporal.seasonal_storage.enable is false."
+        )
+
+        n.snapshot_weightings['stores'] = 1.0
 
 def _extract_model_variable_to_dataframe(model, var_name: str) -> pd.DataFrame:
     """

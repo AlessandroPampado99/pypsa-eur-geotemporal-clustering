@@ -165,3 +165,111 @@ def build_run_table(config: dict[str, Any]) -> pd.DataFrame:
 def load_network(network_path: str | Path) -> pypsa.Network:
     """Load a PyPSA network from NetCDF."""
     return pypsa.Network(str(network_path))
+
+def infer_resources_dir_from_runs_dir(runs_dir: str) -> str:
+    """
+    Infer the resources directory from the results directory.
+
+    Example:
+        results/my_prefix -> resources/my_prefix
+    """
+    parts = Path(runs_dir).parts
+
+    if not parts:
+        return runs_dir
+
+    if parts[0] == "results":
+        return str(Path("resources", *parts[1:]))
+
+    return runs_dir.replace("results", "resources", 1)
+
+
+def build_clustering_history_path(config: dict[str, Any], run_name: str) -> Path:
+    """Build the clustering history path for a run."""
+    root_dir = str(Path(config["paths"]["root_dir"]).expanduser().resolve())
+    runs_dir = config["paths"]["runs_dir"]
+
+    clustering_cfg = config.get("clustering", {})
+    resources_dir = clustering_cfg.get("resources_dir")
+
+    if resources_dir in {None, "null", ""}:
+        resources_dir = infer_resources_dir_from_runs_dir(runs_dir)
+
+    history_filename = clustering_cfg.get("history_filename", "history.csv")
+    history_path_template = clustering_cfg.get(
+        "history_path_template",
+        "{root_dir}/{resources_dir}/{run}/geotemporal_clustering/{history_filename}",
+    )
+
+    path = history_path_template.format(
+        root_dir=root_dir,
+        resources_dir=resources_dir,
+        run=run_name,
+        history_filename=history_filename,
+    )
+
+    return Path(path).expanduser().resolve()
+
+
+def read_last_clustering_objective(
+    history_path: str | Path,
+    objective_column: str = "objective",
+) -> float | None:
+    """Read the last clustering objective value from a history CSV file."""
+    history_path = Path(history_path)
+
+    if not history_path.exists():
+        return None
+
+    history = pd.read_csv(history_path)
+
+    if history.empty:
+        return None
+
+    if objective_column not in history.columns:
+        raise KeyError(
+            f"Column '{objective_column}' not found in clustering history file: "
+            f"{history_path}"
+        )
+
+    values = history[objective_column].dropna()
+
+    if values.empty:
+        return None
+
+    return float(values.iloc[-1])
+
+
+def add_clustering_objectives(
+    df: pd.DataFrame,
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    """Add clustering objective values to the metrics summary dataframe."""
+    clustering_cfg = config.get("clustering", {})
+
+    if not clustering_cfg.get("enabled", False):
+        return df
+
+    objective_column = clustering_cfg.get("objective_column", "objective")
+
+    out = df.copy()
+    clustering_objectives = []
+    clustering_history_paths = []
+
+    for run_name in out["run"]:
+        history_path = build_clustering_history_path(config, run_name)
+        clustering_history_paths.append(str(history_path))
+
+        value = read_last_clustering_objective(
+            history_path=history_path,
+            objective_column=objective_column,
+        )
+        clustering_objectives.append(value)
+
+        if value is None:
+            print(f"[WARNING] Missing clustering objective for run '{run_name}': {history_path}")
+
+    out["clustering_history_path"] = clustering_history_paths
+    out["clustering_objective"] = clustering_objectives
+
+    return out

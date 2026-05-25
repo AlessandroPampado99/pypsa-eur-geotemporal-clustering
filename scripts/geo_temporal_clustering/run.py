@@ -474,7 +474,8 @@ if __name__ == "__main__":
             "geo_temporal_cluster_network",
             clusters="adm",
             opts="Gt",
-            configfiles=["config/config_clustering.yaml"],
+            configfiles=["config/clustering_validation/config_validation_weights.yaml"],
+            run="gtf-n13-d66"
         )
 
     main()

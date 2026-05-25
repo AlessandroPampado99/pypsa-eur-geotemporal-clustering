@@ -89,14 +89,18 @@ def plot_metric_2d_scans(
 
     For budget_scan:
         x = n_nodes
-        color = n_days
-
-    Scans with fewer than two non-reference points are skipped.
+        secondary bottom x-axis = n_days
+        no colorbar and no point annotations
     """
     column = get_plot_column(metric, value_kind)
     if column not in df.columns:
         print(f"[WARNING] Column '{column}' not found. Skipping 2D plot.")
         return
+
+    reference_df = df[df["scan_type"] == "complete"].copy()
+    reference_value = None
+    if not reference_df.empty and column in reference_df.columns:
+        reference_value = float(reference_df.iloc[0][column])
 
     scan_specs = [
         {
@@ -107,6 +111,7 @@ def plot_metric_2d_scans(
             "color_label": "Number of days",
             "title_suffix": "spatial scan",
             "include_complete": True,
+            "use_secondary_days_axis": False,
         },
         {
             "scan_type": "days_scan",
@@ -116,22 +121,21 @@ def plot_metric_2d_scans(
             "color_label": "Number of nodes",
             "title_suffix": "temporal scan",
             "include_complete": True,
+            "use_secondary_days_axis": False,
         },
         {
             "scan_type": "budget_scan",
             "x_col": "n_nodes",
-            "color_col": "n_days",
+            "color_col": None,
             "x_label": "Number of nodes",
-            "color_label": "Number of days",
+            "color_label": None,
             "title_suffix": "constant geo-temporal budget",
             "include_complete": False,
+            "use_secondary_days_axis": True,
         },
     ]
 
-    reference_df = df[df["scan_type"] == "complete"].copy()
-    reference_value = None
-    if not reference_df.empty and column in reference_df.columns:
-        reference_value = float(reference_df.iloc[0][column])
+    created_budget_plot = False
 
     for spec in scan_specs:
         scan_type = spec["scan_type"]
@@ -141,10 +145,10 @@ def plot_metric_2d_scans(
         color_label = spec["color_label"]
         title_suffix = spec["title_suffix"]
         include_complete = spec["include_complete"]
+        use_secondary_days_axis = spec["use_secondary_days_axis"]
 
         non_reference_df = df[df["scan_type"] == scan_type].copy()
 
-        # Skip meaningless 2D scans with only one actual reduced point.
         if len(non_reference_df) < 2:
             print(
                 f"[INFO] Skipping {scan_type} 2D plot for '{metric}' "
@@ -157,30 +161,109 @@ def plot_metric_2d_scans(
         else:
             plot_df = non_reference_df
 
-        plot_df = plot_df.dropna(subset=[column, x_col, color_col])
-        plot_df = plot_df.sort_values(x_col)
+        filename_suffix = scan_type
 
-        if plot_df.empty:
-            continue
-
-        filename = sanitize_filename(f"{metric}_{value_kind}_2d_{scan_type}")
-
-        export_plot_data(
+        _plot_single_2d_scan(
             plot_df=plot_df,
+            metric=metric,
+            column=column,
+            value_kind=value_kind,
+            x_col=x_col,
+            color_col=color_col,
+            x_label=x_label,
+            color_label=color_label,
+            title_suffix=title_suffix,
+            filename_suffix=filename_suffix,
             plots_dir=plots_dir,
-            filename=filename,
+            config=config,
+            reference_value=reference_value,
+            use_secondary_days_axis=use_secondary_days_axis,
         )
 
-        fig, ax = plt.subplots(figsize=(7.6, 4.9))
+        if scan_type == "budget_scan":
+            created_budget_plot = True
 
-        ax.plot(
+    if not created_budget_plot:
+        reduced_df = df[df["scan_type"] != "complete"].copy()
+
+        if len(reduced_df) >= 2:
+            print(
+                f"[INFO] No budget_scan plot was created for '{metric}'. "
+                "Creating fallback reduced_scan plot."
+            )
+
+            _plot_single_2d_scan(
+                plot_df=reduced_df,
+                metric=metric,
+                column=column,
+                value_kind=value_kind,
+                x_col="n_nodes",
+                color_col=None,
+                x_label="Number of nodes",
+                color_label=None,
+                title_suffix="all reduced runs",
+                filename_suffix="reduced_scan",
+                plots_dir=plots_dir,
+                config=config,
+                reference_value=reference_value,
+                use_secondary_days_axis=True,
+            )
+
+def _plot_single_2d_scan(
+    plot_df: pd.DataFrame,
+    metric: str,
+    column: str,
+    value_kind: str,
+    x_col: str,
+    color_col: str | None,
+    x_label: str,
+    color_label: str | None,
+    title_suffix: str,
+    filename_suffix: str,
+    plots_dir: Path,
+    config: dict[str, Any],
+    reference_value: float | None = None,
+    use_secondary_days_axis: bool = False,
+) -> None:
+    """Plot one 2D scan."""
+    required_columns = [column, x_col]
+    if color_col is not None:
+        required_columns.append(color_col)
+
+    plot_df = plot_df.dropna(subset=required_columns).copy()
+    plot_df = plot_df.sort_values(x_col)
+
+    if plot_df.empty:
+        return
+
+    filename = sanitize_filename(f"{metric}_{value_kind}_2d_{filename_suffix}")
+
+    export_plot_data(
+        plot_df=plot_df,
+        plots_dir=plots_dir,
+        filename=filename,
+    )
+
+    fig, ax = plt.subplots(figsize=(7.8, 5.2))
+
+    ax.plot(
+        plot_df[x_col],
+        plot_df[column],
+        linewidth=1.6,
+        alpha=0.75,
+        zorder=1,
+    )
+
+    if color_col is None:
+        ax.scatter(
             plot_df[x_col],
             plot_df[column],
-            linewidth=1.4,
-            alpha=0.55,
-            zorder=1,
+            s=65,
+            edgecolors="black",
+            linewidths=0.4,
+            zorder=2,
         )
-
+    else:
         scatter = ax.scatter(
             plot_df[x_col],
             plot_df[column],
@@ -190,47 +273,272 @@ def plot_metric_2d_scans(
             linewidths=0.4,
             zorder=2,
         )
-
         cbar = fig.colorbar(scatter, ax=ax)
-        cbar.set_label(color_label, fontweight="bold")
+        cbar.set_label(color_label or color_col, fontweight="bold")
 
-        if scan_type == "budget_scan":
-            for _, row in plot_df.iterrows():
-                ax.annotate(
-                    f"d={int(row['n_days'])}",
-                    xy=(row[x_col], row[column]),
-                    xytext=(4, 4),
-                    textcoords="offset points",
-                    fontsize=7,
-                )
+    ax.set_xlabel(x_label, fontweight="bold")
+    ax.set_ylabel(get_ylabel(metric, value_kind), fontweight="bold")
+    ax.set_title(
+        f"{metric.replace('_', ' ')} - {title_suffix}",
+        fontweight="bold",
+    )
+    ax.grid(True, alpha=0.3)
 
-        ax.set_xlabel(x_label, fontweight="bold")
-        ax.set_ylabel(get_ylabel(metric, value_kind), fontweight="bold")
-        ax.set_title(
-            f"{metric.replace('_', ' ')} - {title_suffix}",
-            fontweight="bold",
+    if value_kind in {"delta", "relative_delta"}:
+        ax.axhline(0.0, linewidth=1.0, linestyle="--")
+    elif reference_value is not None and use_secondary_days_axis:
+        ax.axhline(
+            reference_value,
+            linewidth=1.0,
+            linestyle="--",
+            label="complete",
         )
-        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
 
-        if value_kind in {"delta", "relative_delta"}:
-            ax.axhline(0.0, linewidth=1.0, linestyle="--")
-        elif reference_value is not None and scan_type == "budget_scan":
-            ax.axhline(
-                reference_value,
-                linewidth=1.0,
-                linestyle="--",
-                label="complete",
-            )
-            ax.legend(frameon=False)
+    if value_kind == "relative_delta":
+        ax.yaxis.set_major_formatter(lambda x, pos: f"{x * 100:.1f}%")
 
-        if value_kind == "relative_delta":
-            ax.yaxis.set_major_formatter(lambda x, pos: f"{x * 100:.1f}%")
+    if use_secondary_days_axis:
+        add_budget_secondary_xaxis(
+            ax=ax,
+            plot_df=plot_df,
+            x_col=x_col,
+            days_col="n_days",
+        )
 
-        fig.tight_layout()
+    fig.tight_layout()
+    save_figure(fig, plots_dir / filename, config)
+    plt.close(fig)
 
-        save_figure(fig, plots_dir / filename, config)
+def plot_budget_combined_relative_profiles(
+    df: pd.DataFrame,
+    plots_dir: Path,
+    config: dict[str, Any],
+) -> None:
+    """
+    Plot selected budget-scan profiles as relative deltas against the complete case.
+
+    x = number of nodes
+    secondary x-axis = representative days
+    y = relative delta [%]
+    """
+    plot_df = df[df["scan_type"] == "budget_scan"].copy()
+
+    if plot_df.empty:
+        plot_df = df[df["scan_type"] != "complete"].copy()
+        filename_suffix = "reduced_scan"
+        title_suffix = "all reduced runs"
+    else:
+        filename_suffix = "budget_scan"
+        title_suffix = "constant geo-temporal budget"
+
+    if plot_df.empty:
+        print("[WARNING] No reduced runs available for combined budget profile plot.")
+        return
+
+    plot_df = plot_df.sort_values("n_nodes")
+
+    profiles = config.get("plots", {}).get("budget_combined_profiles", [])
+    if not profiles:
+        profiles = [
+            {"metric": "conventional_generation", "label": "Conventional generation"},
+            {"metric": "renewable_capacity", "label": "Renewable capacity"},
+            {"metric": "store_energy_capacity", "label": "Store capacity"},
+            {"metric": "objective", "label": "Objective function"},
+            {"metric": "renewable_generation", "label": "Renewable generation"},
+            {"metric": "link_power_capacity", "label": "Link capacity"},
+        ]
+
+    fig, ax = plt.subplots(figsize=(8.6, 5.5))
+
+    plotted_any = False
+
+    for profile in profiles:
+        metric = profile["metric"]
+        label = profile.get("label", metric.replace("_", " "))
+        column = f"{metric}_relative_delta"
+
+        if column not in plot_df.columns:
+            print(f"[WARNING] Column '{column}' not found. Skipping combined profile.")
+            continue
+
+        profile_df = plot_df.dropna(subset=["n_nodes", "n_days", column]).copy()
+        if profile_df.empty:
+            continue
+
+        y_percent = profile_df[column] * 100.0
+
+        ax.plot(
+            profile_df["n_nodes"],
+            y_percent,
+            marker="o",
+            linewidth=1.8,
+            markersize=4.8,
+            label=label,
+        )
+        plotted_any = True
+
+    if not plotted_any:
         plt.close(fig)
+        print("[WARNING] No valid profile was plotted in combined budget profile plot.")
+        return
 
+    export_plot_data(
+        plot_df=plot_df,
+        plots_dir=plots_dir,
+        filename=f"combined_relative_profiles_2d_{filename_suffix}",
+    )
+
+    ax.axhline(0.0, linewidth=1.0, linestyle="--")
+    ax.set_xlabel("Number of nodes", fontweight="bold")
+    ax.set_ylabel("Relative delta vs complete [%]", fontweight="bold")
+    ax.set_title(
+        f"Budget scan comparison - {title_suffix}",
+        fontweight="bold",
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False, ncols=2)
+
+    add_budget_secondary_xaxis(
+        ax=ax,
+        plot_df=plot_df,
+        x_col="n_nodes",
+        days_col="n_days",
+    )
+
+    fig.tight_layout()
+
+    filename = sanitize_filename(f"combined_relative_profiles_2d_{filename_suffix}")
+    save_figure(fig, plots_dir / filename, config)
+    plt.close(fig)
+    
+
+def plot_optimization_vs_clustering_objective(
+    df: pd.DataFrame,
+    plots_dir: Path,
+    config: dict[str, Any],
+) -> None:
+    """
+    Plot optimization objective and clustering objective along the budget scan.
+
+    The optimization objective is compared against the complete-network reference.
+    The clustering objective is shown on a secondary y-axis because it generally
+    has a different scale and unit.
+    """
+    required = {"objective", "clustering_objective", "n_nodes", "n_days", "scan_type", "run"}
+    missing = required - set(df.columns)
+    if missing:
+        print(
+            "[WARNING] Missing columns for objective comparison plot: "
+            f"{sorted(missing)}. Skipping."
+        )
+        return
+
+    reference_run = config.get("reference", {}).get("run", "complete")
+    reference_df = df[df["run"] == reference_run].copy()
+
+    optimization_reference = None
+    if not reference_df.empty and reference_df["objective"].notna().any():
+        optimization_reference = float(reference_df["objective"].dropna().iloc[0])
+
+    plot_df = df[df["scan_type"] == "budget_scan"].copy()
+
+    if plot_df.empty:
+        plot_df = df[df["scan_type"] != "complete"].copy()
+        filename_suffix = "reduced_scan"
+        title_suffix = "all reduced runs"
+    else:
+        filename_suffix = "budget_scan"
+        title_suffix = "constant geo-temporal budget"
+
+    plot_df = plot_df.dropna(
+        subset=["objective", "clustering_objective", "n_nodes", "n_days"]
+    )
+    plot_df = plot_df.sort_values("n_nodes")
+
+    if plot_df.empty:
+        print(
+            "[WARNING] No runs have both optimization and clustering objectives. "
+            "Skipping objective comparison plot."
+        )
+        return
+
+    filename = sanitize_filename(
+        f"optimization_vs_clustering_objective_2d_{filename_suffix}"
+    )
+
+    export_plot_data(
+        plot_df=plot_df,
+        plots_dir=plots_dir,
+        filename=filename,
+    )
+
+    fig, ax1 = plt.subplots(figsize=(8.6, 5.5))
+
+    optimization_color = "tab:blue"
+    clustering_color = "tab:orange"
+    reference_color = "black"
+
+    line1 = ax1.plot(
+        plot_df["n_nodes"],
+        plot_df["objective"],
+        marker="o",
+        linewidth=1.8,
+        color=optimization_color,
+        label="Optimization objective",
+    )
+
+    reference_line = []
+    if optimization_reference is not None:
+        reference_line = [
+            ax1.axhline(
+                optimization_reference,
+                linewidth=1.2,
+                linestyle="--",
+                color=reference_color,
+                label="Complete optimization objective",
+            )
+        ]
+
+    ax1.set_xlabel("Number of nodes", fontweight="bold")
+    ax1.set_ylabel("Optimization objective", fontweight="bold", color=optimization_color)
+    ax1.tick_params(axis="y", labelcolor=optimization_color)
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+
+    line2 = ax2.plot(
+        plot_df["n_nodes"],
+        plot_df["clustering_objective"],
+        marker="s",
+        linewidth=1.8,
+        linestyle="--",
+        color=clustering_color,
+        label="Clustering objective",
+    )
+
+    ax2.set_ylabel("Clustering objective", fontweight="bold", color=clustering_color)
+    ax2.tick_params(axis="y", labelcolor=clustering_color)
+
+    add_budget_secondary_xaxis(
+        ax=ax1,
+        plot_df=plot_df,
+        x_col="n_nodes",
+        days_col="n_days",
+    )
+
+    lines = line1 + line2 + reference_line
+    labels = [line.get_label() for line in lines]
+    ax1.legend(lines, labels, frameon=False)
+
+    ax1.set_title(
+        f"Optimization vs clustering objective - {title_suffix}",
+        fontweight="bold",
+    )
+
+    fig.tight_layout()
+    save_figure(fig, plots_dir / filename, config)
+    plt.close(fig)
 
 def plot_metric_3d(
     df: pd.DataFrame,
@@ -318,6 +626,42 @@ def plot_metric_3d(
     save_figure(fig, plots_dir / filename, config)
     plt.close(fig)
 
+def add_budget_secondary_xaxis(
+    ax,
+    plot_df: pd.DataFrame,
+    x_col: str = "n_nodes",
+    days_col: str = "n_days",
+    max_ticks: int = 12,
+) -> None:
+    """
+    Add a second bottom x-axis showing representative days.
+
+    This is intended for budget scans where x is the number of spatial nodes and
+    the complementary temporal resolution is represented by labels on a lower axis.
+    """
+    if x_col not in plot_df.columns or days_col not in plot_df.columns:
+        return
+
+    tick_df = (
+        plot_df[[x_col, days_col]]
+        .dropna()
+        .drop_duplicates(subset=[x_col])
+        .sort_values(x_col)
+        .reset_index(drop=True)
+    )
+
+    if tick_df.empty:
+        return
+
+    if len(tick_df) > max_ticks:
+        indices = np.linspace(0, len(tick_df) - 1, max_ticks).round().astype(int)
+        tick_df = tick_df.iloc[np.unique(indices)]
+
+    secax = ax.secondary_xaxis("bottom")
+    secax.spines["bottom"].set_position(("outward", 42))
+    secax.set_xticks(tick_df[x_col].to_numpy())
+    secax.set_xticklabels([str(int(v)) for v in tick_df[days_col].to_numpy()])
+    secax.set_xlabel("Number of representative days", fontweight="bold")
 
 def order_runs_for_heatmap(df: pd.DataFrame) -> list[str]:
     """Return a stable run order for heatmaps."""

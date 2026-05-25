@@ -1,7 +1,7 @@
 paths:
   root_dir: "/home/pampado/clustering/pypsa-eur"
-  runs_dir: "results/reference_nuts3_mean_400"
-  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_400_mean"
+  runs_dir: "results/reference_nuts3_mean_4000"
+  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_4000_mean"
 
 network:
   # Flexible template. Available placeholders:
@@ -21,25 +21,8 @@ runs:
 
 budget_scan:
   enabled: true
-  min_total_steps: 380
-  max_total_steps: 420
-
-clustering:
-  enabled: true
-
-  # Analogous path to results/, but under resources/.
-  # Network:
-  #   results/reference_nuts3_mean_400_noseasonal/<run>/networks/base_s_adm_elec_Gt.nc
-  # Clustering history:
-  #   resources/reference_nuts3_mean_400_noseasonal/<run>/geotemporal_clustering/history.csv
-  resources_dir: "resources/reference_nuts3_mean_400"
-
-  history_filename: "history.csv"
-  objective_column: "objective"
-
-  # Available placeholders:
-  # {root_dir}, {resources_dir}, {run}, {history_filename}
-  history_path_template: "{root_dir}/{resources_dir}/{run}/geotemporal_clustering/base_s_adm_elec_Gt/{history_filename}"
+  min_total_steps: 3800
+  max_total_steps: 4200
 
 carriers:
   conventional:
@@ -68,8 +51,8 @@ metrics:
   capacities: true
 
 weights:
-  # For reconstructed full-year networks, "objective" is often safer if it
-  # contains the correct temporal weights after representative-day expansion.
+  # Usually "generators" is the right choice for energy quantities.
+  # Alternatives in PyPSA can be "objective" or "stores", depending on the workflow.
   energy_weight_column: "objective"
 
 capacity:
@@ -78,22 +61,18 @@ capacity:
       enabled: true
       attribute: "p_nom_opt"
       fallback_attribute: "p_nom"
-
     Link:
       enabled: true
       attribute: "p_nom_opt"
       fallback_attribute: "p_nom"
-
     Store:
       enabled: true
       attribute: "e_nom_opt"
       fallback_attribute: "e_nom"
-
     StorageUnit:
       enabled: true
       attribute: "p_nom_opt"
       fallback_attribute: "p_nom"
-
     Line:
       enabled: true
       attribute: "s_nom_opt"
@@ -107,20 +86,14 @@ plots:
     - pdf
 
   make_2d: true
-
-  # I would keep this false: matplotlib 3D is visually misleading here.
-  make_3d: false
-
-  # Additional plots.
-  make_budget_combined: true
-  make_objective_comparison: true
+  make_3d: true
 
   # Possible values: absolute, delta, relative_delta
   plot_values:
     - absolute
     - relative_delta
 
-  # Metrics available in metrics_summary.csv.
+  # Metrics available in metrics_summary.csv
   metrics:
     - objective
     - renewable_generation
@@ -133,31 +106,9 @@ plots:
     - link_power_capacity
     - line_capacity
 
-  # Combined percentage plot along budget_scan.
-  # All these are plotted as *_relative_delta [%].
-  budget_combined_profiles:
-    - metric: conventional_generation
-      label: "Conventional generation"
-
-    - metric: renewable_capacity
-      label: "Renewable capacity"
-
-    - metric: store_energy_capacity
-      label: "Store capacity"
-
-    - metric: objective
-      label: "Objective function"
-
-    - metric: renewable_generation
-      label: "Renewable generation"
-
-    - metric: link_power_capacity
-      label: "Link capacity"
-
   capacity_heatmaps:
     enabled: true
     value: "relative_delta"
-
     components:
       - Generator
       - Link

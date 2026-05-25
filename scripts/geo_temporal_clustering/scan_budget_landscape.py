@@ -39,7 +39,11 @@ from scripts.geo_temporal_clustering.core import (
     select_buses_from_loads,
     bus_coords_latlon,
     loads_by_bus_timeseries,
+    electric_demand_weights_by_bus,
     cf_by_bus_timeseries,
+    reconstruct_tensor_from_medoids,
+    zscore_global,
+    minmax_global,
 )
 
 
@@ -49,12 +53,12 @@ from scripts.geo_temporal_clustering.core import (
 
 NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/reference_nuts3/complete/networks/base_s_adm_elec_.nc")
 
-OUT_DIR = Path("resources/geotemporal_clustering_scan/beta_opposite_1")
+OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_max_energy")
 
 # Main scan parameters
-TARGET_BUDGET = 900
-MIN_INITIAL_STEPS = 850
-MAX_INITIAL_STEPS = 900
+TARGET_BUDGET = 400
+MIN_INITIAL_STEPS = 380
+MAX_INITIAL_STEPS = 420
 
 # Pair generation mode:
 # - "frontier": one pair per K_nodes, with K_days = floor(TARGET_BUDGET / K_nodes)
@@ -78,7 +82,7 @@ HOURS_PER_DAY = 24
 EXCLUDE_BUS_SUBSTRINGS = (" H2", "battery")
 
 FEATURE_MODE = "daily_stats"
-STATS = ("mean", "max", "min", "std", "ramp_max", "energy")
+STATS = ("mean", "max", "std", "ramp_max")
 
 INCLUDE_LOAD = True
 
@@ -98,18 +102,20 @@ FEATURE_WEIGHTS_CFG = {
     "wind_cf": 1.0,
 }
 
-# Supported: None, "none", "mean_load", "peak_load"
-NODE_WEIGHTS_MODE = None
+# Supported: None, "none", "mean_load", "peak_load", "electric_demand"
+# "electric_demand" uses the total electric demand per bus, including snapshot weightings,
+# and normalizes weights to mean 1.
+NODE_WEIGHTS_MODE = "electric_demand"
 
 # Reducer parameters
 REDUCER_BASE_CFG = {
-    "lambda_ts": 0.05,
+    "lambda_ts": 0.10,
     "normalize": "zscore",
     "max_total_steps": TARGET_BUDGET,
     "loss_norm": "l2_squared",
     "beta": 0.05,
-    "beta_growth": 1.5,
-    "beta_max": 1.0,
+    "beta_growth": 1.3,
+    "beta_max": 1,
     "max_iter": 50,
     "tol_no_change": 7,
     "objective_tol_rel": 1e-5,
@@ -122,10 +128,42 @@ REDUCER_BASE_CFG = {
     "kmedoids_max_iter": 100,
 }
 
+# Temporal representation strategy used when the clustered network is actually built.
+# In this standalone scan the reducer still selects representative days through
+# k-medoids; therefore REPRESENTATION is stored in the outputs for traceability,
+# but it does not change the reducer objective unless the network is later
+# aggregated with apply_temporal_reduction(..., representation=REPRESENTATION).
+# Supported by core.py: "medoid", "mean", "medoid_scaled".
+REPRESENTATION = "mean"
+
 
 # =============================================================================
 # Helpers
 # =============================================================================
+
+def validate_settings() -> None:
+    """Validate user-facing settings before starting the scan."""
+    valid_representations = {"medoid", "mean", "medoid_scaled"}
+    if REPRESENTATION not in valid_representations:
+        raise ValueError(
+            f"REPRESENTATION must be one of {sorted(valid_representations)}, "
+            f"got {REPRESENTATION!r}."
+        )
+
+    valid_node_weight_modes = {None, "none", "mean_load", "peak_load", "electric_demand"}
+    if NODE_WEIGHTS_MODE not in valid_node_weight_modes:
+        raise ValueError(
+            f"NODE_WEIGHTS_MODE must be one of {sorted(map(str, valid_node_weight_modes))}, "
+            f"got {NODE_WEIGHTS_MODE!r}."
+        )
+
+    valid_loss_norms = {"l1", "l2_squared"}
+    if str(REDUCER_BASE_CFG.get("loss_norm")) not in valid_loss_norms:
+        raise ValueError(
+            f"REDUCER_BASE_CFG['loss_norm'] must be one of {sorted(valid_loss_norms)}, "
+            f"got {REDUCER_BASE_CFG.get('loss_norm')!r}."
+        )
+
 
 def build_feature_weights(feature_names: List[str], cfg_weights: Dict[str, float]) -> np.ndarray:
     """
@@ -157,6 +195,100 @@ def build_feature_weights(feature_names: List[str], cfg_weights: Dict[str, float
 
     return weights
 
+def compute_feature_loss_breakdown(
+    *,
+    X: np.ndarray,
+    feature_names: List[str],
+    feature_weights: np.ndarray,
+    node_weights: Optional[np.ndarray],
+    labels_nodes: np.ndarray,
+    labels_days: np.ndarray,
+    rep_nodes: np.ndarray,
+    rep_days: np.ndarray,
+    normalize: str,
+    loss_norm: str,
+) -> pd.DataFrame:
+    """
+    Compute the reducer reconstruction loss contribution feature by feature.
+
+    This mirrors the reducer objective:
+    - X is normalized first using the same normalization mode;
+    - reconstruction is medoid-based;
+    - feature weights are normalized to mean 1;
+    - node weights are normalized to mean 1;
+    - loss can be l2_squared or l1.
+    """
+    X = np.asarray(X, dtype=float)
+    N, D, F = X.shape
+
+    if normalize == "zscore":
+        Xn = zscore_global(X)
+    elif normalize == "minmax":
+        Xn = minmax_global(X)
+    else:
+        raise ValueError("normalize must be either 'zscore' or 'minmax'.")
+
+    X_rec = reconstruct_tensor_from_medoids(
+        Xn,
+        rep_nodes=np.asarray(rep_nodes, dtype=int),
+        labels_nodes=np.asarray(labels_nodes, dtype=int),
+        rep_days=np.asarray(rep_days, dtype=int),
+        labels_days=np.asarray(labels_days, dtype=int),
+    )
+
+    if loss_norm == "l2_squared":
+        err = (Xn - X_rec) ** 2
+    elif loss_norm == "l1":
+        err = np.abs(Xn - X_rec)
+    else:
+        raise ValueError("loss_norm must be either 'l1' or 'l2_squared'.")
+
+    wf = np.asarray(feature_weights, dtype=float)
+    if wf.shape != (F,):
+        raise ValueError(f"feature_weights must have shape ({F},), got {wf.shape}.")
+    if np.any(wf < 0):
+        raise ValueError("feature_weights must be non-negative.")
+    wf_norm = wf / (wf.mean() + 1e-12)
+
+    if node_weights is None:
+        wn_norm = np.ones(N, dtype=float)
+    else:
+        wn = np.asarray(node_weights, dtype=float)
+        if wn.shape != (N,):
+            raise ValueError(f"node_weights must have shape ({N},), got {wn.shape}.")
+        if np.any(wn < 0):
+            raise ValueError("node_weights must be non-negative.")
+        wn_norm = wn / (wn.mean() + 1e-12)
+
+    rows = []
+    for f, name in enumerate(feature_names):
+        # Loss contribution of feature f:
+        # sum_n w_n * sum_d err[n,d,f] * normalized_feature_weight[f]
+        loss_unweighted = float(err[:, :, f].sum())
+        loss_node_weighted = float((err[:, :, f].sum(axis=1) * wn_norm).sum())
+        loss_weighted = float(loss_node_weighted * wf_norm[f])
+
+        rows.append(
+            {
+                "feature": str(name),
+                "feature_weight_raw": float(wf[f]),
+                "feature_weight_normalized": float(wf_norm[f]),
+                "loss_unweighted": loss_unweighted,
+                "loss_node_weighted": loss_node_weighted,
+                "loss_weighted": loss_weighted,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    total = float(out["loss_weighted"].sum())
+    out["loss_share"] = out["loss_weighted"] / (total + 1e-12)
+
+    # Useful grouped fields, e.g. load_mean -> variable=load, stat=mean
+    parts = out["feature"].str.rsplit("_", n=1, expand=True)
+    out["feature_family"] = parts[0]
+    out["stat"] = parts[1]
+
+    return out.sort_values("loss_weighted", ascending=False).reset_index(drop=True)
 
 def build_scan_pairs(
     *,
@@ -560,10 +692,19 @@ def prepare_clustering_inputs(network_path: Path) -> dict:
                 raise ValueError("NODE_WEIGHTS_MODE='peak_load' requires load to be included.")
             node_weights = data_hourly["load"].max(axis=1).astype(float)
 
+        elif mode == "electric_demand":
+            node_weights = electric_demand_weights_by_bus(
+                n,
+                base_buses,
+                use_snapshot_weightings=True,
+                normalization="mean",
+                fallback_to_uniform=True,
+            ).astype(float)
+
         else:
             raise ValueError(
                 f"Unsupported NODE_WEIGHTS_MODE={NODE_WEIGHTS_MODE}. "
-                "Supported: None, 'none', 'mean_load', 'peak_load'."
+                "Supported: None, 'none', 'mean_load', 'peak_load', 'electric_demand'."
             )
 
     print(f">>> Built X with shape {X.shape} = (nodes, days, features)")
@@ -590,6 +731,7 @@ def run_one_reducer(
     lat: np.ndarray,
     lon: np.ndarray,
     base_buses: List[str],
+    feature_names: List[str],
     feature_weights: np.ndarray,
     node_weights: Optional[np.ndarray],
     run_id: str,
@@ -597,7 +739,7 @@ def run_one_reducer(
     init_nodes: Optional[int],
     init_days: Optional[int],
     random_state: int,
-) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Run one reducer instance and return summary, history, and evaluations.
     """
@@ -605,6 +747,7 @@ def run_one_reducer(
         lambda_ts=float(REDUCER_BASE_CFG["lambda_ts"]),
         normalize=str(REDUCER_BASE_CFG["normalize"]),
         max_total_steps=int(REDUCER_BASE_CFG["max_total_steps"]),
+        loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
         init_mode=str(init_mode),
         init_nodes=init_nodes,
         init_days=init_days,
@@ -635,6 +778,26 @@ def run_one_reducer(
         node_weights=node_weights,
     )
 
+    feature_losses = compute_feature_loss_breakdown(
+        X=X,
+        feature_names=feature_names,
+        feature_weights=feature_weights,
+        node_weights=node_weights,
+        labels_nodes=result.labels_nodes,
+        labels_days=result.labels_days,
+        rep_nodes=result.rep_nodes,
+        rep_days=result.rep_days,
+        normalize=str(REDUCER_BASE_CFG["normalize"]),
+        loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
+    )
+
+    feature_losses.insert(0, "run_id", run_id)
+    feature_losses.insert(1, "init_mode", init_mode)
+    feature_losses.insert(2, "init_nodes", init_nodes)
+    feature_losses.insert(3, "init_days", init_days)
+    feature_losses.insert(4, "random_state", int(random_state))
+    feature_losses.insert(5, "representation", REPRESENTATION)
+
     elapsed = time.perf_counter() - t0
 
     final_k_nodes = int(len(np.unique(result.labels_nodes)))
@@ -648,6 +811,8 @@ def run_one_reducer(
         "init_days": init_days,
         "init_steps": None if init_nodes is None or init_days is None else int(init_nodes * init_days),
         "random_state": int(random_state),
+        "representation": REPRESENTATION,
+        "node_weights_mode": NODE_WEIGHTS_MODE,
         "final_K_nodes": final_k_nodes,
         "final_K_days": final_k_days,
         "final_total_steps": final_steps,
@@ -657,6 +822,7 @@ def run_one_reducer(
         "n_evaluation_rows": int(len(result.evaluations)),
         "lambda_ts": float(REDUCER_BASE_CFG["lambda_ts"]),
         "max_total_steps": int(REDUCER_BASE_CFG["max_total_steps"]),
+        "loss_norm": str(REDUCER_BASE_CFG["loss_norm"]),
         "beta": float(REDUCER_BASE_CFG["beta"]),
         "beta_growth": float(REDUCER_BASE_CFG["beta_growth"]),
         "beta_max": float(REDUCER_BASE_CFG["beta_max"]),
@@ -673,6 +839,7 @@ def run_one_reducer(
         history.insert(2, "init_nodes", init_nodes)
         history.insert(3, "init_days", init_days)
         history.insert(4, "random_state", int(random_state))
+        history.insert(5, "representation", REPRESENTATION)
 
     evaluations = pd.DataFrame(result.evaluations)
     if not evaluations.empty:
@@ -681,17 +848,20 @@ def run_one_reducer(
         evaluations.insert(2, "init_nodes", init_nodes)
         evaluations.insert(3, "init_days", init_days)
         evaluations.insert(4, "random_state", int(random_state))
+        evaluations.insert(5, "representation", REPRESENTATION)
 
     if not history.empty and not evaluations.empty:
         history = enrich_history_with_evaluation_alternatives(history, evaluations)
 
-    return summary, history, evaluations
+    return summary, history, evaluations, feature_losses
 
 
 def main() -> None:
     """
     Main scan routine.
     """
+    validate_settings()
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     inputs = prepare_clustering_inputs(NETWORK_PATH)
@@ -741,6 +911,7 @@ def main() -> None:
         "feature_names": inputs["feature_names"],
         "feature_weights": feature_weights.tolist(),
         "node_weights_mode": NODE_WEIGHTS_MODE,
+        "representation": REPRESENTATION,
         "reducer_base_cfg": REDUCER_BASE_CFG,
     }
 
@@ -750,6 +921,7 @@ def main() -> None:
     summaries: List[dict] = []
     histories: List[pd.DataFrame] = []
     evaluations: List[pd.DataFrame] = []
+    feature_losses_all: List[pd.DataFrame] = []
 
     total_runs = len(pairs) * len(RANDOM_STATES)
     if RUN_FULL_BASELINE:
@@ -770,11 +942,12 @@ def main() -> None:
                 f"init_mode=full, seed={seed}"
             )
 
-            summary, history, evals = run_one_reducer(
+            summary, history, evals, feature_losses = run_one_reducer(
                 X=X,
                 lat=lat,
                 lon=lon,
                 base_buses=base_buses,
+                feature_names=inputs["feature_names"],
                 feature_weights=feature_weights,
                 node_weights=node_weights,
                 run_id=run_id,
@@ -789,8 +962,16 @@ def main() -> None:
                 histories.append(history)
             if not evals.empty:
                 evaluations.append(evals)
+            if not feature_losses.empty:
+                feature_losses_all.append(feature_losses)
 
             pd.DataFrame(summaries).to_csv(OUT_DIR / "scan_summary.csv", index=False)
+
+            if feature_losses_all:
+                pd.concat(feature_losses_all, ignore_index=True).to_csv(
+                    OUT_DIR / "scan_feature_losses.csv",
+                    index=False,
+                )
 
     # -------------------------------------------------------------------------
     # Initial-pair scan
@@ -806,11 +987,12 @@ def main() -> None:
                 f"init=({init_nodes}, {init_days}), steps={init_steps}, seed={seed}"
             )
 
-            summary, history, evals = run_one_reducer(
+            summary, history, evals, feature_losses = run_one_reducer(
                 X=X,
                 lat=lat,
                 lon=lon,
                 base_buses=base_buses,
+                feature_names=inputs["feature_names"],
                 feature_weights=feature_weights,
                 node_weights=node_weights,
                 run_id=run_id,
@@ -825,6 +1007,8 @@ def main() -> None:
                 histories.append(history)
             if not evals.empty:
                 evaluations.append(evals)
+            if not feature_losses.empty:
+                feature_losses_all.append(feature_losses)
 
             # Incremental output, useful if the scan is interrupted.
             pd.DataFrame(summaries).to_csv(OUT_DIR / "scan_summary.csv", index=False)
@@ -840,6 +1024,12 @@ def main() -> None:
                     OUT_DIR / "scan_evaluations.csv",
                     index=False,
                 )
+            
+            if feature_losses_all:
+                pd.concat(feature_losses_all, ignore_index=True).to_csv(
+                    OUT_DIR / "scan_feature_losses.csv",
+                    index=False,
+                )
 
     df_summary = pd.DataFrame(summaries).sort_values("objective")
     df_summary.to_csv(OUT_DIR / "scan_summary.csv", index=False)
@@ -851,6 +1041,58 @@ def main() -> None:
     if evaluations:
         df_evaluations = pd.concat(evaluations, ignore_index=True)
         df_evaluations.to_csv(OUT_DIR / "scan_evaluations.csv", index=False)
+
+    if feature_losses_all:
+        df_feature_losses = pd.concat(feature_losses_all, ignore_index=True)
+        df_feature_losses.to_csv(OUT_DIR / "scan_feature_losses.csv", index=False)
+
+        feature_loss_summary = (
+            df_feature_losses
+            .groupby(["feature"], as_index=False)
+            .agg(
+                loss_weighted_mean=("loss_weighted", "mean"),
+                loss_share_mean=("loss_share", "mean"),
+                loss_share_max=("loss_share", "max"),
+                n_runs=("loss_share", "size"),
+            )
+            .sort_values("loss_share_mean", ascending=False)
+        )
+        feature_loss_summary.to_csv(
+            OUT_DIR / "feature_loss_summary.csv",
+            index=False,
+        )
+
+        stat_loss_summary = (
+            df_feature_losses
+            .groupby(["stat"], as_index=False)
+            .agg(
+                loss_weighted_mean=("loss_weighted", "mean"),
+                loss_share_mean=("loss_share", "mean"),
+                loss_share_max=("loss_share", "max"),
+                n_runs=("loss_share", "size"),
+            )
+            .sort_values("loss_share_mean", ascending=False)
+        )
+        stat_loss_summary.to_csv(
+            OUT_DIR / "stat_loss_summary.csv",
+            index=False,
+        )
+
+        family_loss_summary = (
+            df_feature_losses
+            .groupby(["feature_family"], as_index=False)
+            .agg(
+                loss_weighted_mean=("loss_weighted", "mean"),
+                loss_share_mean=("loss_share", "mean"),
+                loss_share_max=("loss_share", "max"),
+                n_runs=("loss_share", "size"),
+            )
+            .sort_values("loss_share_mean", ascending=False)
+        )
+        family_loss_summary.to_csv(
+            OUT_DIR / "feature_family_loss_summary.csv",
+            index=False,
+        )
 
     best_runs = df_summary.head(30).copy()
     best_runs.to_csv(OUT_DIR / "best_runs.csv", index=False)

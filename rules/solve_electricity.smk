@@ -72,6 +72,9 @@ rule solve_network_gt:
     output:
         network=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt.nc",
         config=RESULTS + "configs/config.base_s_{clusters}_elec_{opts}.yaml",
+        full_timeline=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt_full_timeline.csv",
+        storage_units_t_full_soc=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt_storage_units_t_full_soc.csv",
+        stores_t_full_e=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt_stores_t_full_e.csv",
     log:
         solver=normpath(
             RESULTS + "logs/solve_network/base_s_{clusters}_elec_{opts}_gt_solver.log"
@@ -102,7 +105,8 @@ rule expand_gt_optimized_network:
         storage_units_t_full_soc=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt_storage_units_t_full_soc.csv",
         stores_t_full_e=RESULTS + "networks/base_s_{clusters}_elec_{opts}_gt_stores_t_full_e.csv",
     output:
-        network=RESULTS + "networks/base_s_{clusters}_elec_{opts}.nc"
+        network=RESULTS + "networks/base_s_{clusters}_elec_{opts}.nc",
+        marker=touch(RESULTS + "networks/.base_s_{clusters}_elec_{opts}_expanded_gt.done"),
     log:
         RESULTS + "logs/geo_temporal_clustering/expand_gt_{clusters}_{opts}.log"
     benchmark:

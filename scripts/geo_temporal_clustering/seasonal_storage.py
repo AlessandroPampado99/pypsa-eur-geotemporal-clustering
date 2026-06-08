@@ -698,6 +698,7 @@ def _add_store_seasonal_constraints(
     # -------------------------------------------------------------------------
     # Initial energy
     # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     if "e_initial" in n.stores.columns:
         init_raw = n.stores["e_initial"].reindex(store_names)
     else:
@@ -707,45 +708,52 @@ def _add_store_seasonal_constraints(
         e_nom_fix_series = n.stores.loc[fix_store, "e_nom"].astype(float)
         init_fix = init_raw.loc[fix_store].copy()
 
-        init_fix_abs = pd.Series(index=fix_store, dtype=float)
-        for s in fix_store:
-            val = init_fix.loc[s]
-            if pd.isna(val):
-                init_fix_abs.loc[s] = 0.5 * e_nom_fix_series.loc[s]
-            else:
-                init_fix_abs.loc[s] = float(val)
+        explicit_fix = init_fix.index[init_fix.notna()]
+        default_fix = init_fix.index[init_fix.isna()]
 
-        rhs = xr.DataArray(
-            init_fix_abs.to_numpy(),
-            dims=("Store",),
-            coords={"Store": fix_store},
-        )
-        m.add_constraints(
-            e.sel(Store=fix_store, t=0) == rhs,
-            name="Store-e_full-init-fix",
-        )
+        if len(explicit_fix) > 0:
+            rhs = xr.DataArray(
+                init_fix.loc[explicit_fix].astype(float).to_numpy(),
+                dims=("Store",),
+                coords={"Store": explicit_fix},
+            )
+            m.add_constraints(
+                e.sel(Store=explicit_fix, t=0) == rhs,
+                name="Store-e_full-init-fix-explicit",
+            )
+
+        if len(default_fix) > 0 and not use_year_cyclic:
+            rhs = xr.DataArray(
+                (0.5 * e_nom_fix_series.loc[default_fix]).to_numpy(),
+                dims=("Store",),
+                coords={"Store": default_fix},
+            )
+            m.add_constraints(
+                e.sel(Store=default_fix, t=0) == rhs,
+                name="Store-e_full-init-fix-default",
+            )
 
     if len(ext_store) > 0:
         init_ext = init_raw.loc[ext_store].copy()
 
-        abs_idx = init_ext.index[init_ext.notna()]
-        nan_idx = init_ext.index[init_ext.isna()]
+        explicit_ext = init_ext.index[init_ext.notna()]
+        default_ext = init_ext.index[init_ext.isna()]
 
-        if len(abs_idx) > 0:
+        if len(explicit_ext) > 0:
             rhs = xr.DataArray(
-                init_ext.loc[abs_idx].astype(float).to_numpy(),
+                init_ext.loc[explicit_ext].astype(float).to_numpy(),
                 dims=("Store",),
-                coords={"Store": abs_idx},
+                coords={"Store": explicit_ext},
             )
             m.add_constraints(
-                e.sel(Store=abs_idx, t=0) == rhs,
-                name="Store-e_full-init-ext-abs",
+                e.sel(Store=explicit_ext, t=0) == rhs,
+                name="Store-e_full-init-ext-explicit",
             )
 
-        if len(nan_idx) > 0:
-            rhs = 0.5 * e_nom_ext.sel(Store=nan_idx)
+        if len(default_ext) > 0 and not use_year_cyclic:
+            rhs = 0.5 * e_nom_ext.sel(Store=default_ext)
             m.add_constraints(
-                e.sel(Store=nan_idx, t=0) == rhs,
+                e.sel(Store=default_ext, t=0) == rhs,
                 name="Store-e_full-init-ext-default",
             )
 

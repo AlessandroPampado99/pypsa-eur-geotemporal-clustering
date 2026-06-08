@@ -1,0 +1,184 @@
+# ---------------------------------------------------------------------------
+# Fixed-pair geo-temporal scan:
+# 730 <= fixed_nodes * fixed_days <= 900
+# ---------------------------------------------------------------------------
+
+gtf-n2-d365:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 2
+        fixed_days: 365
+        max_total_steps: 730
+
+gtf-n4-d200:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 4
+        fixed_days: 200
+        max_total_steps: 800
+
+gtf-n6-d140:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 6
+        fixed_days: 140
+        max_total_steps: 840
+
+gtf-n8-d100:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 8
+        fixed_days: 100
+        max_total_steps: 800
+
+gtf-n10-d80:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 10
+        fixed_days: 80
+        max_total_steps: 800
+
+gtf-n13-d66:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 13
+        fixed_days: 66
+        max_total_steps: 858
+
+gtf-n16-d50:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 16
+        fixed_days: 50
+        max_total_steps: 800
+
+gtf-n20-d40:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 20
+        fixed_days: 40
+        max_total_steps: 800
+
+gtf-n25-d36:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 25
+        fixed_days: 36
+        max_total_steps: 900
+
+gtf-n30-d30:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 30
+        fixed_days: 30
+        max_total_steps: 900
+
+gtf-n36-d24:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 36
+        fixed_days: 24
+        max_total_steps: 864
+
+gtf-n44-d18:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 44
+        fixed_days: 18
+        max_total_steps: 792
+
+gtf-n50-d17:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 50
+        fixed_days: 17
+        max_total_steps: 850
+
+gtf-n54-d16:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 54
+        fixed_days: 16
+        max_total_steps: 864
+
+gtf-n68-d13:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 68
+        fixed_days: 13
+        max_total_steps: 884
+
+gtf-n77-d11:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 77
+        fixed_days: 11
+        max_total_steps: 847
+
+gtf-n81-d11:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 81
+        fixed_days: 11
+        max_total_steps: 891
+
+gtf-n90-d10:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 90
+        fixed_days: 10
+        max_total_steps: 900
+
+gtf-n94-d9:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 94
+        fixed_days: 9
+        max_total_steps: 846
+
+gtf-n96-d8:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 96
+        fixed_days: 8
+        max_total_steps: 768

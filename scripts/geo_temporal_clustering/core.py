@@ -4,7 +4,6 @@ Geo-temporal clustering core utilities for PyPSA-Eur integration.
 
 This module is intentionally self-contained and uses only public PyPSA APIs.
 
-All comments are in English by request.
 """
 
 from dataclasses import dataclass
@@ -15,7 +14,6 @@ import pandas as pd
 import scipy.sparse as sp
 import geopandas as gpd
 
-from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import pairwise_distances
 from sklearn.decomposition import PCA
 
@@ -662,25 +660,462 @@ def build_day_distance(
 # Alternating reducer
 # =============================================================================
 
+
 @dataclass
 class ReductionResult:
     labels_nodes: np.ndarray
     labels_days: np.ndarray
+    rep_nodes: np.ndarray
+    rep_node_weights: np.ndarray
     rep_days: np.ndarray
     rep_weights: np.ndarray
     history: List[dict]
+    evaluations: List[dict]
     day_pca_info: dict
+    objective: float
     region_membership: Optional[pd.Series] = None
 
 
+def _relabel_contiguous(labels: np.ndarray) -> np.ndarray:
+    """Relabel cluster ids to 0..K-1 preserving order of first appearance."""
+    labels = np.asarray(labels, dtype=int)
+    uniques = []
+    mapping = {}
+    out = np.empty_like(labels)
+    for i, val in enumerate(labels):
+        if int(val) not in mapping:
+            mapping[int(val)] = len(mapping)
+            uniques.append(int(val))
+        out[i] = mapping[int(val)]
+    return out.astype(int)
+
+
+def _cluster_sizes_from_labels(labels: np.ndarray) -> np.ndarray:
+    """Return cluster sizes for contiguous labels."""
+    labels = np.asarray(labels, dtype=int)
+    if labels.size == 0:
+        return np.zeros(0, dtype=int)
+    return np.bincount(labels, minlength=int(labels.max()) + 1).astype(int)
+
+def _cluster_weight_sums_from_labels(
+    labels: np.ndarray,
+    node_weights: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Return cluster weights for contiguous labels.
+
+    If node_weights is None, this falls back to cluster cardinality.
+    Otherwise, each cluster weight is the sum of the initial node weights
+    assigned to that cluster.
+    """
+    labels = _relabel_contiguous(labels)
+
+    if labels.size == 0:
+        return np.zeros(0, dtype=float)
+
+    K = int(labels.max()) + 1
+
+    if node_weights is None:
+        return np.bincount(labels, minlength=K).astype(float)
+
+    w = np.asarray(node_weights, dtype=float)
+
+    if w.shape != labels.shape:
+        raise ValueError("node_weights must have the same shape as labels.")
+
+    if np.any(w < 0):
+        raise ValueError("node_weights must be non-negative.")
+
+    return np.bincount(labels, weights=w, minlength=K).astype(float)
+
+def _medoids_from_labels(D: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return medoid indices and cluster sizes for a labeled partition."""
+    labels = _relabel_contiguous(labels)
+    K = int(labels.max()) + 1 if labels.size else 0
+    medoids = np.zeros(K, dtype=int)
+    sizes = np.zeros(K, dtype=int)
+
+    for k in range(K):
+        idx = np.where(labels == k)[0]
+        sizes[k] = len(idx)
+        if len(idx) == 1:
+            medoids[k] = int(idx[0])
+            continue
+        D_within = D[np.ix_(idx, idx)]
+        medoids[k] = int(idx[int(np.argmin(D_within.sum(axis=1)))])
+    return medoids, sizes
+
+
+def _farthest_point_from_set(D: np.ndarray, chosen: List[int]) -> int:
+    """Pick the point farthest from the current chosen set."""
+    n = D.shape[0]
+    remaining = np.setdiff1d(np.arange(n, dtype=int), np.asarray(chosen, dtype=int), assume_unique=False)
+    if len(remaining) == 0:
+        return int(chosen[-1])
+    if len(chosen) == 0:
+        return int(remaining[0])
+    dist_to_set = D[np.ix_(remaining, np.asarray(chosen, dtype=int))].min(axis=1)
+    return int(remaining[int(np.argmax(dist_to_set))])
+
+
+def _initialize_medoids_greedy(D: np.ndarray, k: int) -> np.ndarray:
+    """Greedy farthest-point initialization for k-medoids on a precomputed distance matrix."""
+    n = D.shape[0]
+    if k >= n:
+        return np.arange(n, dtype=int)
+
+    total = D.sum(axis=1)
+    medoids = [int(np.argmin(total))]
+    while len(medoids) < k:
+        medoids.append(_farthest_point_from_set(D, medoids))
+    return np.asarray(medoids, dtype=int)
+
+
+def kmedoids_precomputed(
+    D: np.ndarray,
+    k: int,
+    *,
+    max_iter: int = 100,
+    random_state: int = 0,
+    init_medoids: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Simple PAM-style k-medoids on a precomputed distance matrix.
+
+    Returns
+    -------
+    labels : np.ndarray
+        Contiguous labels 0..k-1.
+    medoids : np.ndarray
+        Indices of the medoid points, aligned with label ids.
+    """
+    D = np.asarray(D, dtype=float)
+    n = D.shape[0]
+    if D.shape != (n, n):
+        raise ValueError("Distance matrix must be square.")
+    if k < 1 or k > n:
+        raise ValueError(f"k must be in [1, {n}], got {k}.")
+
+    rng = np.random.RandomState(random_state)
+
+    if init_medoids is not None:
+        medoids = np.asarray(init_medoids, dtype=int).copy()
+        if len(np.unique(medoids)) != k:
+            raise ValueError("init_medoids must contain k unique indices.")
+    else:
+        medoids = _initialize_medoids_greedy(D, k)
+        if len(medoids) != k:
+            remaining = np.setdiff1d(np.arange(n, dtype=int), medoids, assume_unique=False)
+            rng.shuffle(remaining)
+            medoids = np.concatenate([medoids, remaining[: k - len(medoids)]])
+
+    medoids = np.asarray(medoids, dtype=int)
+
+    for _ in range(max_iter):
+        d_to_medoids = D[:, medoids]
+        labels = np.argmin(d_to_medoids, axis=1).astype(int)
+
+        # Fix potential empty clusters by re-seeding with farthest points
+        counts = np.bincount(labels, minlength=k)
+        if np.any(counts == 0):
+            missing = np.where(counts == 0)[0]
+            used_points = set(medoids.tolist())
+            for cl in missing:
+                new_medoid = _farthest_point_from_set(D, list(used_points))
+                medoids[cl] = new_medoid
+                used_points.add(int(new_medoid))
+            d_to_medoids = D[:, medoids]
+            labels = np.argmin(d_to_medoids, axis=1).astype(int)
+
+        new_medoids = medoids.copy()
+        changed = False
+
+        for cl in range(k):
+            idx = np.where(labels == cl)[0]
+            if len(idx) == 0:
+                continue
+            D_within = D[np.ix_(idx, idx)]
+            best_local = int(np.argmin(D_within.sum(axis=1)))
+            best_point = int(idx[best_local])
+            if best_point != medoids[cl]:
+                new_medoids[cl] = best_point
+                changed = True
+
+        medoids = new_medoids
+
+        if not changed:
+            break
+
+    labels = np.argmin(D[:, medoids], axis=1).astype(int)
+
+    # Reorder clusters by medoid index for determinism
+    order = np.argsort(medoids)
+    medoids = medoids[order]
+    inv = np.empty_like(order)
+    inv[order] = np.arange(k)
+    labels = inv[labels]
+
+    return labels.astype(int), medoids.astype(int)
+
+
+def reconstruct_tensor_from_medoids(
+    X: np.ndarray,
+    *,
+    rep_nodes: np.ndarray,
+    labels_nodes: np.ndarray,
+    rep_days: np.ndarray,
+    labels_days: np.ndarray,
+) -> np.ndarray:
+    """
+    Reconstruct X[N,D,F] by repeating spatial and temporal medoids.
+
+    For each original pair (n, d), the reconstructed value is taken from:
+    X[rep_nodes[label_nodes[n]], rep_days[label_days[d]], :].
+    """
+    X = np.asarray(X, dtype=float)
+    rep_nodes = np.asarray(rep_nodes, dtype=int)
+    labels_nodes = np.asarray(labels_nodes, dtype=int)
+    rep_days = np.asarray(rep_days, dtype=int)
+    labels_days = np.asarray(labels_days, dtype=int)
+
+    node_src = rep_nodes[labels_nodes]
+    day_src = rep_days[labels_days]
+
+    return X[node_src[:, None], day_src[None, :], :]
+
+def reconstruct_tensor_from_medoids_temporal_mean(
+    X: np.ndarray,
+    *,
+    rep_nodes: np.ndarray,
+    labels_nodes: np.ndarray,
+    labels_days: np.ndarray,
+) -> np.ndarray:
+    """
+    Reconstruct X[N,D,F] using spatial medoids and temporal cluster means.
+
+    For each original pair (n, d), the reconstructed value is:
+    mean over all days assigned to labels_days[d], evaluated at the spatial
+    medoid of node n's cluster.
+
+    This is useful when the final temporal representation is "mean", because
+    the clustering objective becomes consistent with the temporal aggregation.
+    """
+    X = np.asarray(X, dtype=float)
+    rep_nodes = np.asarray(rep_nodes, dtype=int)
+    labels_nodes = np.asarray(labels_nodes, dtype=int)
+    labels_days = np.asarray(labels_days, dtype=int)
+
+    N, D, F = X.shape
+
+    if labels_nodes.shape != (N,):
+        raise ValueError("labels_nodes must have shape (N,).")
+    if labels_days.shape != (D,):
+        raise ValueError("labels_days must have shape (D,).")
+
+    node_src = rep_nodes[labels_nodes]
+
+    X_rec = np.empty_like(X)
+
+    for c_day in np.unique(labels_days):
+        day_idx = np.where(labels_days == c_day)[0]
+
+        # Mean profile of each spatial medoid over the days in this temporal cluster.
+        # Shape: (N, F), after selecting node_src.
+        cluster_mean = X[np.ix_(node_src, day_idx)].mean(axis=1)
+
+        X_rec[:, day_idx, :] = cluster_mean[:, None, :]
+
+    return X_rec
+
+def weighted_reconstruction_loss(
+    X: np.ndarray,
+    X_rec: np.ndarray,
+    *,
+    feature_weights: Optional[np.ndarray] = None,
+    node_loss_weights: Optional[np.ndarray] = None,
+    loss_norm: Literal["l1", "l2_squared"] = "l2_squared",
+) -> float:
+    """
+    Weighted reconstruction loss on X[N,D,F].
+
+    Supported losses:
+    - "l2_squared":
+        sum_n w_n * sum_f w_f * sum_d (X - X_rec)^2
+
+    - "l1":
+        sum_n w_n * sum_f w_f * sum_d |X - X_rec|
+
+    Feature weights and node weights are internally normalized to have mean 1.
+    """
+    X = np.asarray(X, dtype=float)
+    X_rec = np.asarray(X_rec, dtype=float)
+
+    if X.shape != X_rec.shape:
+        raise ValueError("X and X_rec must have the same shape.")
+
+    N, _, F = X.shape
+
+    if loss_norm == "l2_squared":
+        err = (X - X_rec) ** 2
+    elif loss_norm == "l1":
+        err = np.abs(X - X_rec)
+    else:
+        raise ValueError("loss_norm must be either 'l1' or 'l2_squared'.")
+
+    if feature_weights is None:
+        wf = np.ones(F, dtype=float)
+    else:
+        wf = np.asarray(feature_weights, dtype=float)
+        if wf.shape != (F,):
+            raise ValueError(f"feature_weights must have shape ({F},), got {wf.shape}.")
+        if np.any(wf < 0):
+            raise ValueError("feature_weights must be non-negative.")
+        wf = wf / (wf.mean() + 1e-12)
+
+    if node_loss_weights is None:
+        wn = np.ones(N, dtype=float)
+    else:
+        wn = np.asarray(node_loss_weights, dtype=float)
+        if wn.shape != (N,):
+            raise ValueError(f"node_loss_weights must have shape ({N},), got {wn.shape}.")
+        if np.any(wn < 0):
+            raise ValueError("node_loss_weights must be non-negative.")
+        wn = wn / (wn.mean() + 1e-12)
+
+    err = err * wf[None, None, :]
+    err = err.sum(axis=(1, 2))
+
+    return float(np.sum(wn * err))
+
+def _candidate_summary(candidate_solutions: List[dict]) -> dict:
+    """
+    Build a compact summary of the candidate alternatives tested at one iteration.
+
+    This is meant for history rows. The detailed candidate-by-candidate log is
+    still stored in evaluations.
+    """
+    if not candidate_solutions:
+        return dict(
+            n_candidates=0,
+            candidate_pairs="",
+            candidate_objectives="",
+            best_candidate_K_nodes=None,
+            best_candidate_K_days=None,
+            best_candidate_total_steps=None,
+            best_candidate_move_type=None,
+            best_candidate_objective=None,
+        )
+
+    ordered = sorted(candidate_solutions, key=lambda s: float(s["objective"]))
+    best = ordered[0]
+
+    candidate_pairs = ";".join(
+        f"{int(c['K_nodes'])}x{int(c['K_days'])}:{str(c.get('move_type', ''))}"
+        for c in candidate_solutions
+    )
+
+    candidate_objectives = ";".join(
+        f"{int(c['K_nodes'])}x{int(c['K_days'])}:{float(c['objective']):.12e}"
+        for c in candidate_solutions
+    )
+
+    return dict(
+        n_candidates=int(len(candidate_solutions)),
+        candidate_pairs=candidate_pairs,
+        candidate_objectives=candidate_objectives,
+        best_candidate_K_nodes=int(best["K_nodes"]),
+        best_candidate_K_days=int(best["K_days"]),
+        best_candidate_total_steps=int(best["total_steps"]),
+        best_candidate_move_type=str(best.get("move_type", "")),
+        best_candidate_objective=float(best["objective"]),
+    )
+
+
+def _append_candidate_evaluations(
+    evaluations: List[dict],
+    *,
+    iter_id: int,
+    phase: str,
+    current_solution: dict,
+    candidate_solutions: List[dict],
+    beta: Optional[float] = None,
+    accepted_solution: Optional[dict] = None,
+) -> None:
+    """
+    Append detailed candidate evaluations for one iteration.
+
+    Each row contains both:
+    - the current pair from which the candidate was generated;
+    - the candidate pair being tested;
+    - whether the candidate was accepted.
+    """
+    if not candidate_solutions:
+        return
+
+    ordered = sorted(candidate_solutions, key=lambda s: float(s["objective"]))
+    rank_by_pair = {
+        (int(c["K_nodes"]), int(c["K_days"])): rank
+        for rank, c in enumerate(ordered, start=1)
+    }
+
+    accepted_pair = None
+    if accepted_solution is not None:
+        accepted_pair = (
+            int(accepted_solution["K_nodes"]),
+            int(accepted_solution["K_days"]),
+        )
+
+    for cand in candidate_solutions:
+        pair = (int(cand["K_nodes"]), int(cand["K_days"]))
+
+        row = dict(
+            iter=int(iter_id),
+            phase=str(phase),
+            move_type=str(cand.get("move_type", "")),
+
+            current_K_nodes=int(current_solution["K_nodes"]),
+            current_K_days=int(current_solution["K_days"]),
+            current_total_steps=int(current_solution["total_steps"]),
+            current_objective=float(current_solution["objective"]),
+
+            candidate_K_nodes=int(cand["K_nodes"]),
+            candidate_K_days=int(cand["K_days"]),
+            candidate_total_steps=int(cand["total_steps"]),
+            candidate_objective=float(cand["objective"]),
+
+            # Backward-compatible columns
+            K_nodes=int(cand["K_nodes"]),
+            K_days=int(cand["K_days"]),
+            total_steps=int(cand["total_steps"]),
+            objective=float(cand["objective"]),
+
+            candidate_rank=int(rank_by_pair[pair]),
+            accepted=bool(accepted_pair is not None and pair == accepted_pair),
+            n_candidates=int(len(candidate_solutions)),
+        )
+
+        if beta is not None:
+            row["beta"] = float(beta)
+
+        evaluations.append(row)
+
 class AlternatingSpatioTemporalReducer:
     """
-    Alternating reducer implementing:
-    - Iter 0: node clustering uses ALL days with uniform weights.
-    - Iter >=1: node clustering uses ONLY representative days (medoids) with weights.
-    - Day clustering ALWAYS uses ALL days, but on spatially aggregated representation defined by current node clusters.
-    - Optional PCA in the day clustering distance computation.
-    - Optional spatial adjacency constraint on node merges.
+    Budget-based alternating geo-temporal reducer.
+
+    Main ideas
+    ----------
+    - The total geo-temporal budget is controlled through max_total_steps.
+    - lambda_ts remains an external hyperparameter and only affects the
+      spatial distance matrix.
+    - Spatial and temporal clustering use k-medoids on precomputed distances.
+    - The accepted solution at each iteration is the one with the lowest
+      reconstruction loss among the tested candidates.
+    - Two initialization modes are supported:
+      * "balanced": start directly from a near-balanced pair (K_nodes, K_days)
+        under the target budget.
+      * "full": start from full resolution and progressively reduce the budget
+        using beta until the target budget is reached.
     """
 
     def __init__(
@@ -688,39 +1123,340 @@ class AlternatingSpatioTemporalReducer:
         *,
         lambda_ts: float = 0.85,
         normalize: Literal["zscore", "minmax"] = "zscore",
-        node_threshold: float = 0.25,
-        day_threshold: float = 0.30,
-        linkage: Literal["average", "complete"] = "complete",
-        max_iter: int = 10,
+        max_total_steps: int = 144,
+        reduction_mode: Literal["budget", "fixed_pair"] = "budget",
+        fixed_nodes: Optional[int] = None,
+        fixed_days: Optional[int] = None,
+        loss_norm: Literal["l1", "l2_squared"] = "l2_squared",
+        init_mode: Literal["balanced", "full"] = "balanced",
+        init_nodes: Optional[int] = None,
+        init_days: Optional[int] = None,
+        beta: float = 0.15,
+        beta_growth: float = 2.0,
+        beta_max: float = 0.5,
+        max_iter: int = 20,
         tol_no_change: int = 2,
+        objective_tol_rel: float = 1e-5,
         verbose: bool = True,
         norm_q: float = 0.95,
         use_pca_days: bool = False,
         pca_days_n_components: Union[int, float] = 0.95,
         pca_days_random_state: int = 0,
         standardize_day_matrix_cols: bool = False,
+        kmedoids_max_iter: int = 100,
+        random_state: int = 0,
         enforce_spatial_adjacency: bool = False,
         regions_gdf: Optional[gpd.GeoDataFrame] = None,
         region_name_col: str = "name",
+        feature_weights: Optional[np.ndarray] = None,
     ):
+        self.reduction_mode = str(reduction_mode)
+        self.fixed_nodes = None if fixed_nodes is None else int(fixed_nodes)
+        self.fixed_days = None if fixed_days is None else int(fixed_days)
+
         self.lambda_ts = float(lambda_ts)
         self.normalize = normalize
-        self.node_threshold = float(node_threshold)
-        self.day_threshold = float(day_threshold)
-        self.linkage = linkage
+        self.max_total_steps = int(max_total_steps)
+        self.init_mode = str(init_mode)
+        self.init_nodes = None if init_nodes is None else int(init_nodes)
+        self.init_days = None if init_days is None else int(init_days)
+        self.beta = float(beta)
+        self.beta_growth = float(beta_growth)
+        self.beta_max = float(beta_max)
         self.max_iter = int(max_iter)
         self.tol_no_change = int(tol_no_change)
+        self.objective_tol_rel = float(objective_tol_rel)
         self.verbose = bool(verbose)
         self.norm_q = float(norm_q)
+        self.loss_norm = str(loss_norm)
 
         self.use_pca_days = bool(use_pca_days)
         self.pca_days_n_components = pca_days_n_components
         self.pca_days_random_state = int(pca_days_random_state)
         self.standardize_day_matrix_cols = bool(standardize_day_matrix_cols)
 
+        self.kmedoids_max_iter = int(kmedoids_max_iter)
+        self.random_state = int(random_state)
+
         self.enforce_spatial_adjacency = bool(enforce_spatial_adjacency)
         self.regions_gdf = regions_gdf
         self.region_name_col = str(region_name_col)
+
+        self.feature_weights = feature_weights
+
+    def _balanced_pair(self, N: int, D: int, budget: int) -> Tuple[int, int]:
+        """Find a near-balanced integer pair (K_nodes, K_days) under the budget."""
+        best_pair = (1, 1)
+        best_budget = 1
+        best_score = np.inf
+
+        max_kn = min(N, max(1, budget))
+        for kn in range(1, max_kn + 1):
+            kd = min(D, max(1, budget // kn))
+            used = kn * kd
+            score = abs(np.log(kn + 1e-12) - np.log(kd + 1e-12))
+            if used > best_budget or (used == best_budget and score < best_score):
+                best_pair = (kn, kd)
+                best_budget = used
+                best_score = score
+
+        return best_pair
+
+    def _initialize_pair(self, N: int, D: int) -> Tuple[int, int]:
+        """Choose the initial pair (K_nodes, K_days)."""
+        full_budget = N * D
+        target_budget = min(self.max_total_steps, full_budget)
+
+        if self.init_mode == "full":
+            return N, D
+
+        if self.init_nodes is not None and self.init_days is not None:
+            kn = min(N, max(1, self.init_nodes))
+            kd = min(D, max(1, self.init_days))
+            if kn * kd > target_budget:
+                kd = max(1, min(D, target_budget // kn))
+            return kn, kd
+
+        if self.init_nodes is not None:
+            kn = min(N, max(1, self.init_nodes))
+            kd = max(1, min(D, target_budget // kn))
+            return kn, kd
+
+        if self.init_days is not None:
+            kd = min(D, max(1, self.init_days))
+            kn = max(1, min(N, target_budget // kd))
+            return kn, kd
+
+        return self._balanced_pair(N, D, target_budget)
+
+    def _build_spatial_distance(
+        self,
+        Xn: np.ndarray,
+        D_geo_n: np.ndarray,
+        rep_days: np.ndarray,
+        rep_weights: np.ndarray,
+    ) -> np.ndarray:
+        """Build the combined node distance matrix conditioned on the current temporal mapping."""
+        X_for_nodes = Xn[:, rep_days, :]
+        D_ts_raw = build_node_ts_distance(X_for_nodes, rep_weights.astype(float))
+        D_ts_n = normalize_distance_matrix(D_ts_raw, q=self.norm_q)
+        return self.lambda_ts * D_ts_n + (1.0 - self.lambda_ts) * D_geo_n
+
+    def _solve_for_pair(
+        self,
+        Xn: np.ndarray,
+        D_geo_n: np.ndarray,
+        rep_days_seed: np.ndarray,
+        rep_weights_seed: np.ndarray,
+        K_nodes: int,
+        K_days: int,
+        *,
+        node_loss_weights: Optional[np.ndarray] = None,
+        node_cluster_weights: Optional[np.ndarray] = None,
+    ) -> dict:
+        """
+        Solve one alternating step for a fixed pair (K_nodes, K_days).
+
+        Spatial clustering is conditioned on the provided temporal seed
+        (representative days and weights). Temporal clustering is then computed
+        on the medoid-based spatial representation.
+        """
+        D_node = self._build_spatial_distance(Xn, D_geo_n, rep_days_seed, rep_weights_seed)
+        labels_nodes, rep_nodes = kmedoids_precomputed(
+            D_node,
+            K_nodes,
+            max_iter=self.kmedoids_max_iter,
+            random_state=self.random_state,
+        )
+        labels_nodes = _relabel_contiguous(labels_nodes)
+
+        rep_node_weights = _cluster_weight_sums_from_labels(
+            labels_nodes,
+            node_cluster_weights,
+        )
+
+        X_rep_nodes = Xn[rep_nodes, :, :]
+        D_day_raw, day_pca_info = build_day_distance(
+            X_rep_nodes,
+            cluster_sizes=rep_node_weights,
+            use_pca=self.use_pca_days,
+            pca_n_components=self.pca_days_n_components,
+            pca_random_state=self.pca_days_random_state,
+            standardize_day_matrix_cols=self.standardize_day_matrix_cols,
+        )
+        D_day_n = normalize_distance_matrix(D_day_raw, q=self.norm_q)
+
+        labels_days, rep_days = kmedoids_precomputed(
+            D_day_n,
+            K_days,
+            max_iter=self.kmedoids_max_iter,
+            random_state=self.random_state,
+        )
+        labels_days = _relabel_contiguous(labels_days)
+        rep_weights = _cluster_sizes_from_labels(labels_days)
+
+        X_rec = reconstruct_tensor_from_medoids_temporal_mean(
+            Xn,
+            rep_nodes=rep_nodes,
+            labels_nodes=labels_nodes,
+            labels_days=labels_days,
+        )
+        objective = weighted_reconstruction_loss(
+            Xn,
+            X_rec,
+            feature_weights=self.feature_weights,
+            node_loss_weights=node_loss_weights,
+            loss_norm=self.loss_norm,
+        )
+
+        return dict(
+            K_nodes=int(K_nodes),
+            K_days=int(K_days),
+            labels_nodes=labels_nodes,
+            labels_days=labels_days,
+            rep_nodes=rep_nodes.astype(int),
+            rep_node_weights=rep_node_weights.astype(float),
+            rep_days=rep_days.astype(int),
+            rep_weights=rep_weights.astype(int),
+            objective=float(objective),
+            day_pca_info=day_pca_info,
+            total_steps=int(K_nodes * K_days),
+        )
+
+    def _candidate_pairs_reduce_budget(
+        self,
+        K_nodes: int,
+        K_days: int,
+        next_budget: int,
+        N: int,
+        D: int,
+    ) -> List[Tuple[int, int, str]]:
+        """Generate candidate pairs when the current budget must be reduced."""
+        candidates: List[Tuple[int, int, str]] = []
+
+        kn_red = max(1, min(N, next_budget // max(1, K_days)))
+        if kn_red < K_nodes:
+            candidates.append((kn_red, K_days, "reduce_space"))
+
+        kd_red = max(1, min(D, next_budget // max(1, K_nodes)))
+        if kd_red < K_days:
+            candidates.append((K_nodes, kd_red, "reduce_time"))
+
+        if not candidates:
+            kn_bal, kd_bal = self._balanced_pair(N, D, next_budget)
+            candidates.append((kn_bal, kd_bal, "reduce_balanced"))
+
+        return candidates
+
+    def _candidate_pairs_rebalance(
+        self,
+        K_nodes: int,
+        K_days: int,
+        target_budget: int,
+        N: int,
+        D: int,
+        *,
+        beta_current: float,
+    ) -> List[Tuple[int, int, str]]:
+        """
+        Generate boundary-aware candidate pairs around the current solution.
+
+        The search radius is controlled by beta_current. Larger beta values
+        generate coarser moves, smaller beta values generate finer moves.
+
+        Candidates always satisfy:
+        - 1 <= K_nodes <= N
+        - 1 <= K_days <= D
+        - K_nodes * K_days <= target_budget
+
+        Boundary logic:
+        - If nodes cannot be increased because K_nodes == N, the algorithm
+          can only keep nodes fixed or move toward fewer nodes with more days.
+        - If days cannot be increased because K_days == D, the algorithm
+          can only keep days fixed or move toward fewer days with more nodes.
+        """
+        candidates: List[Tuple[int, int, str]] = []
+
+        beta_current = float(beta_current)
+        if beta_current <= 0.0:
+            raise ValueError("beta_current must be > 0.")
+
+        current_pair = (int(K_nodes), int(K_days))
+
+        def add_candidate(kn: int, kd: int, move_type: str) -> None:
+            """Add a feasible candidate if it is new and different from current."""
+            kn = int(max(1, min(N, kn)))
+            kd = int(max(1, min(D, kd)))
+
+            if kn * kd > target_budget:
+                return
+
+            pair = (kn, kd)
+            if pair == current_pair:
+                return
+
+            candidates.append((kn, kd, str(move_type)))
+
+        # ------------------------------------------------------------------
+        # Candidate 1: move toward more spatial detail.
+        #
+        # If K_nodes can increase, increase nodes and adapt days to stay
+        # inside the budget.
+        # ------------------------------------------------------------------
+        if K_nodes < N:
+            kn_target = int(np.ceil(K_nodes * (1.0 + beta_current)))
+            kn_new = min(N, max(K_nodes + 1, kn_target))
+            kd_new = max(1, min(D, target_budget // kn_new))
+
+            add_candidate(kn_new, kd_new, "more_space")
+
+        # ------------------------------------------------------------------
+        # Candidate 2: move toward more temporal detail.
+        #
+        # If K_days can increase, increase days and adapt nodes to stay
+        # inside the budget.
+        # ------------------------------------------------------------------
+        if K_days < D:
+            kd_target = int(np.ceil(K_days * (1.0 + beta_current)))
+            kd_new = min(D, max(K_days + 1, kd_target))
+            kn_new = max(1, min(N, target_budget // kd_new))
+
+            add_candidate(kn_new, kd_new, "more_time")
+
+        # ------------------------------------------------------------------
+        # Candidate 3: boundary fill with fixed nodes.
+        #
+        # Useful when K_nodes is already at the maximum. Example:
+        # current = 96 nodes, 20 days, target budget = 2880.
+        # Then 96 nodes and 30 days is feasible and should be tested.
+        # ------------------------------------------------------------------
+        if K_nodes == N:
+            kd_fill = min(D, target_budget // K_nodes)
+            if kd_fill > K_days:
+                add_candidate(K_nodes, kd_fill, "fill_time_at_max_space")
+
+        # ------------------------------------------------------------------
+        # Candidate 4: boundary fill with fixed days.
+        #
+        # Symmetric case when K_days is already at the maximum.
+        # ------------------------------------------------------------------
+        if K_days == D:
+            kn_fill = min(N, target_budget // K_days)
+            if kn_fill > K_nodes:
+                add_candidate(kn_fill, K_days, "fill_space_at_max_time")
+
+        # Remove duplicates while preserving order.
+        seen = set()
+        unique_candidates: List[Tuple[int, int, str]] = []
+
+        for kn, kd, move_type in candidates:
+            key = (int(kn), int(kd))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append((int(kn), int(kd), str(move_type)))
+
+        return unique_candidates
 
     def fit(
         self,
@@ -732,20 +1468,29 @@ class AlternatingSpatioTemporalReducer:
         node_weights: Optional[np.ndarray] = None,
     ) -> ReductionResult:
         X = np.asarray(X, dtype=float)
-        N, D, _ = X.shape
+        N, D, F = X.shape
 
         lat_deg = np.asarray(lat_deg, dtype=float)
         lon_deg = np.asarray(lon_deg, dtype=float)
         if lat_deg.shape != (N,) or lon_deg.shape != (N,):
             raise ValueError("lat_deg and lon_deg must have shape (N,).")
 
+        if self.feature_weights is not None:
+            fw = np.asarray(self.feature_weights, dtype=float)
+            if fw.shape != (F,):
+                raise ValueError(f"feature_weights must have shape ({F},), got {fw.shape}.")
+
         if buses is None:
             raise ValueError("buses must be provided when fitting the spatial reducer.")
         if len(buses) != N:
             raise ValueError("buses must have length N.")
-        buses = list(map(str, buses))
 
-        # Feature-wise normalization
+        if self.enforce_spatial_adjacency:
+            raise NotImplementedError(
+                "Spatial adjacency constraints are not yet implemented for the new "
+                "k-medoids budget-based reducer."
+            )
+
         if self.normalize == "zscore":
             Xn = zscore_global(X)
         elif self.normalize == "minmax":
@@ -756,151 +1501,622 @@ class AlternatingSpatioTemporalReducer:
         D_geo = haversine_pairwise_km(lat_deg, lon_deg)
         D_geo_n = normalize_distance_matrix(D_geo, q=self.norm_q)
 
-        node_connectivity = None
-        region_membership = None
+        if node_weights is None:
+            node_loss_weights = None
+            node_cluster_weights = None
+        else:
+            node_cluster_weights = np.asarray(node_weights, dtype=float)
 
-        if self.enforce_spatial_adjacency:
-            if self.regions_gdf is None:
+            if node_cluster_weights.shape != (N,):
+                raise ValueError("node_weights must have shape (N,).")
+
+            if np.any(node_cluster_weights < 0):
+                raise ValueError("node_weights must be non-negative.")
+
+            if node_cluster_weights.sum() <= 0.0:
+                raise ValueError("node_weights must have positive total weight.")
+
+            # Same initial weights are used for the reconstruction loss.
+            # weighted_reconstruction_loss normalizes them internally to mean 1.
+            node_loss_weights = node_cluster_weights
+
+        # ------------------------------------------------------------------
+        # Fixed-pair mode: solve exactly one (K_nodes, K_days) configuration
+        # ------------------------------------------------------------------
+
+        if self.reduction_mode == "fixed_pair":
+            K_nodes = int(self.fixed_nodes)
+            K_days = int(self.fixed_days)
+
+            if K_nodes < 1 or K_nodes > N:
                 raise ValueError(
-                    "regions_gdf must be provided when enforce_spatial_adjacency=True."
+                    f"fixed_nodes must be in [1, {N}], got {K_nodes}."
+                )
+            if K_days < 1 or K_days > D:
+                raise ValueError(
+                    f"fixed_days must be in [1, {D}], got {K_days}."
                 )
 
-            node_connectivity, region_membership = build_bus_connectivity_from_regions(
-                buses=buses,
-                lat_deg=lat_deg,
-                lon_deg=lon_deg,
-                regions_gdf=self.regions_gdf,
-                region_name_col=self.region_name_col,
-            )
+            rep_days_seed = np.arange(D, dtype=int)
+            rep_weights_seed = np.ones(D, dtype=int)
+
+            if K_nodes == N and K_days == D:
+                current_solution = dict(
+                    K_nodes=int(N),
+                    K_days=int(D),
+                    labels_nodes=np.arange(N, dtype=int),
+                    labels_days=np.arange(D, dtype=int),
+                    rep_nodes=np.arange(N, dtype=int),
+                    rep_node_weights=(
+                        np.ones(N, dtype=float)
+                        if node_cluster_weights is None
+                        else node_cluster_weights.astype(float).copy()
+                    ),
+                    rep_days=np.arange(D, dtype=int),
+                    rep_weights=np.ones(D, dtype=int),
+                    objective=0.0,
+                    day_pca_info=dict(use_pca=False),
+                    total_steps=int(N * D),
+                )
+            else:
+                current_solution = self._solve_for_pair(
+                    Xn,
+                    D_geo_n,
+                    rep_days_seed,
+                    rep_weights_seed,
+                    K_nodes,
+                    K_days,
+                    node_loss_weights=node_loss_weights,
+                    node_cluster_weights=node_cluster_weights,
+                )
+
+            history = [
+                dict(
+                    iter=0,
+                    phase="fixed_pair",
+                    status="accepted_fixed_pair",
+                    K_nodes=int(current_solution["K_nodes"]),
+                    K_days=int(current_solution["K_days"]),
+                    total_steps=int(current_solution["total_steps"]),
+                    objective=float(current_solution["objective"]),
+                )
+            ]
+
+            evaluations = [
+                dict(
+                    iter=0,
+                    phase="fixed_pair",
+                    move_type="fixed_pair",
+                    K_nodes=int(current_solution["K_nodes"]),
+                    K_days=int(current_solution["K_days"]),
+                    total_steps=int(current_solution["total_steps"]),
+                    objective=float(current_solution["objective"]),
+                )
+            ]
 
             if self.verbose:
-                n_allowed_pairs = int(node_connectivity.nnz)
                 print(
-                    f"[Adjacency] Spatial connectivity enabled | "
-                    f"nodes={N} | allowed_pairs={n_allowed_pairs}"
+                    "[Fixed pair] "
+                    f"K_nodes={current_solution['K_nodes']} | "
+                    f"K_days={current_solution['K_days']} | "
+                    f"steps={current_solution['total_steps']} | "
+                    f"objective={current_solution['objective']:.6e}"
                 )
 
+            return ReductionResult(
+                labels_nodes=current_solution["labels_nodes"].astype(int),
+                labels_days=current_solution["labels_days"].astype(int),
+                rep_nodes=current_solution["rep_nodes"].astype(int),
+                rep_node_weights=current_solution["rep_node_weights"].astype(float),
+                rep_days=current_solution["rep_days"].astype(int),
+                rep_weights=current_solution["rep_weights"].astype(int),
+                history=history,
+                evaluations=evaluations,
+                day_pca_info=current_solution["day_pca_info"],
+                objective=float(current_solution["objective"]),
+                region_membership=None,
+            )
+
+        target_budget = min(self.max_total_steps, N * D)
+
+        K_nodes, K_days = self._initialize_pair(N, D)
+        current_budget = int(K_nodes * K_days)
+
+        evaluations: List[dict] = []
         history: List[dict] = []
-        stable_counter = 0
 
-        labels_nodes_prev: Optional[np.ndarray] = None
-        labels_days_prev: Optional[np.ndarray] = None
+        rep_days_seed = np.arange(D, dtype=int)
+        rep_weights_seed = np.ones(D, dtype=int)
 
-        rep_days = np.arange(D, dtype=int)
-        rep_weights = np.ones(D, dtype=int)
-
-        last_day_pca_info: dict = {}
-
-        for it in range(self.max_iter):
-            # 1) Node clustering
-            if it == 0:
-                X_for_nodes = Xn
-                w_for_nodes = np.ones(D, dtype=float)
-                used_days = D
-            else:
-                X_for_nodes = Xn[:, rep_days, :]
-                w_for_nodes = rep_weights.astype(float)
-                used_days = len(rep_days)
-
-            D_ts_raw = build_node_ts_distance(X_for_nodes, w_for_nodes)
-            D_ts_n = normalize_distance_matrix(D_ts_raw, q=self.norm_q)
-
-            D_node = self.lambda_ts * D_ts_n + (1.0 - self.lambda_ts) * D_geo_n
-
-            labels_nodes = _agglomerative_precomputed(
-                D_node,
-                distance_threshold=self.node_threshold,
-                linkage=self.linkage,
-                connectivity=node_connectivity,
+        if current_budget == N * D:
+            current_solution = dict(
+                K_nodes=int(N),
+                K_days=int(D),
+                labels_nodes=np.arange(N, dtype=int),
+                labels_days=np.arange(D, dtype=int),
+                rep_nodes=np.arange(N, dtype=int),
+                rep_node_weights=(
+                    np.ones(N, dtype=float)
+                    if node_cluster_weights is None
+                    else node_cluster_weights.astype(float).copy()
+                ),
+                rep_days=np.arange(D, dtype=int),
+                rep_weights=np.ones(D, dtype=int),
+                objective=0.0,
+                day_pca_info=dict(use_pca=False),
+                total_steps=int(N * D),
             )
-            K_nodes = int(len(np.unique(labels_nodes)))
-
-            # 2) Day clustering (always on ALL days)
-            X_agg, cluster_sizes = aggregate_nodes_by_cluster(
+        else:
+            current_solution = self._solve_for_pair(
                 Xn,
-                labels_nodes,
-                node_weights=node_weights,
+                D_geo_n,
+                rep_days_seed,
+                rep_weights_seed,
+                K_nodes,
+                K_days,
+                node_loss_weights=node_loss_weights,
+                node_cluster_weights=node_cluster_weights,
             )
 
-            D_day_raw, day_pca_info = build_day_distance(
-                X_agg,
-                cluster_sizes=cluster_sizes,
-                use_pca=self.use_pca_days,
-                pca_n_components=self.pca_days_n_components,
-                pca_random_state=self.pca_days_random_state,
-                standardize_day_matrix_cols=self.standardize_day_matrix_cols,
-            )
-            last_day_pca_info = day_pca_info
+        no_improve_counter = 0
+        it_global = 0
+        it_feasible = 0
 
-            D_day_n = normalize_distance_matrix(D_day_raw, q=self.norm_q)
+        # Safety guard only for pathological cases during infeasible reduction
+        max_infeasible_iters = max(10 * self.max_iter, 50)
 
-            labels_days = _agglomerative_precomputed(
-                D_day_n,
-                distance_threshold=self.day_threshold,
-                linkage=self.linkage,
-            )
-            K_days = int(len(np.unique(labels_days)))
-
-            rep_days, rep_weights = representative_medoids(D_day_raw, labels_days)
+        # ------------------------------------------------------------------
+        # Phase 1: mandatory reduction until the solution is feasible
+        # ------------------------------------------------------------------
+        while int(current_solution["total_steps"]) > target_budget:
+            current_budget = int(current_solution["total_steps"])
+            current_obj = float(current_solution["objective"])
 
             history.append(
                 dict(
-                    iter=it,
-                    used_days_for_node_distance=int(used_days),
-                    K_nodes=K_nodes,
-                    K_days=K_days,
-                    n_rep_days=int(len(rep_days)),
-                    day_pca=day_pca_info,
-                    adjacency_enabled=bool(self.enforce_spatial_adjacency),
+                    iter=int(it_global),
+                    phase="reduce_to_budget",
+                    status="accepted_infeasible",
+                    K_nodes=int(current_solution["K_nodes"]),
+                    K_days=int(current_solution["K_days"]),
+                    total_steps=int(current_solution["total_steps"]),
+                    objective=float(current_obj),
                 )
             )
 
             if self.verbose:
-                if day_pca_info.get("use_pca", False):
-                    r = day_pca_info["pca_n_components_selected"]
-                    ev = day_pca_info["pca_explained_variance_ratio_sum"]
-                    pca_str = f"PCA(r={r}, EV={ev:.3f})"
-                else:
-                    pca_str = "no PCA"
-
                 print(
-                    f"[Iter {it}] used_days_for_nodes={used_days} | "
-                    f"K_nodes={K_nodes} | K_days={K_days} | "
-                    f"rep_days={len(rep_days)} | {pca_str}"
+                    f"[Iter {it_global}] accepted_infeasible | "
+                    f"K_nodes={current_solution['K_nodes']} | "
+                    f"K_days={current_solution['K_days']} | "
+                    f"steps={current_solution['total_steps']} | "
+                    f"objective={current_obj:.6e}"
                 )
 
-            same_nodes = (
-                labels_nodes_prev is not None
-                and np.array_equal(labels_nodes, labels_nodes_prev)
-            )
-            same_days = (
-                labels_days_prev is not None
-                and np.array_equal(labels_days, labels_days_prev)
+            next_budget = max(
+                target_budget,
+                int(np.floor(current_budget * (1.0 - self.beta)))
             )
 
-            stable_counter = stable_counter + 1 if (same_nodes and same_days) else 0
+            candidate_pairs = self._candidate_pairs_reduce_budget(
+                int(current_solution["K_nodes"]),
+                int(current_solution["K_days"]),
+                next_budget,
+                N,
+                D,
+            )
 
-            labels_nodes_prev = labels_nodes.copy()
-            labels_days_prev = labels_days.copy()
+            if len(candidate_pairs) == 0:
+                # Hard fallback: jump directly to a balanced feasible pair
+                kn_bal, kd_bal = self._balanced_pair(N, D, target_budget)
+                candidate_pairs = [(kn_bal, kd_bal, "force_feasible_balanced")]
 
-            if stable_counter >= self.tol_no_change:
+            seed_days = current_solution["rep_days"]
+            seed_weights = current_solution["rep_weights"]
+
+            candidate_solutions = []
+            for cand_kn, cand_kd, move_type in candidate_pairs:
+                cand = self._solve_for_pair(
+                    Xn,
+                    D_geo_n,
+                    seed_days,
+                    seed_weights,
+                    cand_kn,
+                    cand_kd,
+                    node_loss_weights=node_loss_weights,
+                    node_cluster_weights=node_cluster_weights,
+                )
+                cand["move_type"] = move_type
+                candidate_solutions.append(cand)
+
+                evaluations.append(
+                    dict(
+                        iter=int(it_global),
+                        phase="reduce_to_budget",
+                        move_type=str(move_type),
+                        K_nodes=int(cand["K_nodes"]),
+                        K_days=int(cand["K_days"]),
+                        total_steps=int(cand["total_steps"]),
+                        objective=float(cand["objective"]),
+                    )
+                )
+
                 if self.verbose:
-                    print(f"[Converged] Stable for {stable_counter} consecutive iterations.")
-                break
+                    print(
+                        f"    candidate={move_type:>22s} | "
+                        f"K_nodes={cand['K_nodes']} | "
+                        f"K_days={cand['K_days']} | "
+                        f"steps={cand['total_steps']} | "
+                        f"objective={cand['objective']:.6e}"
+                    )
+
+            # Among reduction candidates, prefer feasibility first, then lower objective
+            feasible_candidates = [
+                c for c in candidate_solutions if int(c["total_steps"]) <= target_budget
+            ]
+
+            if feasible_candidates:
+                best_candidate = min(feasible_candidates, key=lambda s: float(s["objective"]))
+            else:
+                # If none is feasible yet, keep reducing. Prefer the smallest total_steps,
+                # then the lowest objective among those.
+                best_candidate = min(
+                    candidate_solutions,
+                    key=lambda s: (int(s["total_steps"]), float(s["objective"])),
+                )
+
+            current_solution = best_candidate
+            it_global += 1
+
+            if it_global >= max_infeasible_iters and int(current_solution["total_steps"]) > target_budget:
+                raise RuntimeError(
+                    "The reducer could not reach a feasible solution under max_total_steps. "
+                    f"Current total_steps={current_solution['total_steps']}, "
+                    f"target={target_budget}."
+                )
+
+        # Log the first feasible solution before starting local rebalancing
+        current_budget = int(current_solution["total_steps"])
+        current_obj = float(current_solution["objective"])
+        history.append(
+            dict(
+                iter=int(it_global),
+                phase="feasible_search",
+                status="accepted_feasible",
+                K_nodes=int(current_solution["K_nodes"]),
+                K_days=int(current_solution["K_days"]),
+                total_steps=int(current_solution["total_steps"]),
+                objective=float(current_obj),
+            )
+        )
+
+        if self.verbose:
+            print(
+                f"[Iter {it_global}] accepted_feasible | "
+                f"K_nodes={current_solution['K_nodes']} | "
+                f"K_days={current_solution['K_days']} | "
+                f"steps={current_solution['total_steps']} | "
+                f"objective={current_obj:.6e}"
+            )
+
+        # ------------------------------------------------------------------
+        # Phase 2: local search within the feasible region
+        # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        beta_current = float(self.beta)
+
+                # ------------------------------------------------------------------
+        # Phase 2: local search within the feasible region
+        # ------------------------------------------------------------------
+        beta_min = float(self.beta)
+        beta_start = float(self.beta_max)
+
+        if beta_min <= 0.0:
+            raise ValueError("beta must be > 0.")
+        if beta_start <= 0.0:
+            raise ValueError("beta_max must be > 0.")
+        if beta_start < beta_min:
+            raise ValueError(
+                "For descending-beta search, beta_max must be >= beta. "
+                f"Got beta_max={beta_start}, beta={beta_min}."
+            )
+        if self.beta_growth <= 1.0:
+            raise ValueError(
+                "For descending-beta search, beta_growth must be > 1. "
+                f"Got beta_growth={self.beta_growth}."
+            )
+
+        beta_current = beta_start
+        tested_transitions = set()
+
+        while it_feasible < self.max_iter:
+            current_budget = int(current_solution["total_steps"])
+            current_obj = float(current_solution["objective"])
+            beta_used = float(beta_current)
+
+            visited_pairs = set()
+
+            candidate_pairs = self._candidate_pairs_rebalance(
+                int(current_solution["K_nodes"]),
+                int(current_solution["K_days"]),
+                target_budget,
+                N,
+                D,
+                beta_current=beta_used,
+            )
+
+            # Drop duplicated pairs and transitions already tested from the current solution.
+            filtered_candidate_pairs = []
+            seen_pairs_this_iter = set()
+
+            current_pair = (
+                int(current_solution["K_nodes"]),
+                int(current_solution["K_days"]),
+            )
+
+            for cand_kn, cand_kd, move_type in candidate_pairs:
+                candidate_pair = (int(cand_kn), int(cand_kd))
+
+                if candidate_pair == current_pair:
+                    continue
+
+                if candidate_pair in seen_pairs_this_iter:
+                    continue
+
+                transition_key = (
+                    int(current_solution["K_nodes"]),
+                    int(current_solution["K_days"]),
+                    int(cand_kn),
+                    int(cand_kd),
+                )
+
+                if transition_key in tested_transitions:
+                    continue
+
+                seen_pairs_this_iter.add(candidate_pair)
+                tested_transitions.add(transition_key)
+
+                filtered_candidate_pairs.append((cand_kn, cand_kd, move_type))
+
+            if len(filtered_candidate_pairs) == 0:
+                no_improve_counter += 1
+
+                beta_current = max(
+                    beta_min,
+                    beta_used / float(self.beta_growth),
+                )
+
+                history.append(
+                    dict(
+                        iter=int(it_global + 1),
+                        phase="feasible_search",
+                        status="no_new_pairs",
+                        K_nodes=int(current_solution["K_nodes"]),
+                        K_days=int(current_solution["K_days"]),
+                        total_steps=int(current_solution["total_steps"]),
+                        objective=float(current_solution["objective"]),
+                        beta=float(beta_used),
+                        next_beta=float(beta_current),
+                        no_change=int(no_improve_counter),
+                    )
+                )
+
+                if self.verbose:
+                    print(
+                        f"[No new pairs] beta={beta_used:.6f} | "
+                        f"next_beta={beta_current:.6f} | "
+                        f"no_change={no_improve_counter}"
+                    )
+
+                it_global += 1
+                it_feasible += 1
+
+                # Stop only if the finest beta has already been tested.
+                if (
+                    no_improve_counter >= self.tol_no_change
+                    or beta_used <= beta_min + 1e-12
+                ):
+                    if self.verbose:
+                        print(
+                            f"[Converged] No new/improving feasible candidates. "
+                            f"beta={beta_used:.6f}, no_change={no_improve_counter}"
+                        )
+                    break
+
+                continue
+
+            seed_days = current_solution["rep_days"]
+            seed_weights = current_solution["rep_weights"]
+
+            candidate_solutions = []
+
+            for cand_kn, cand_kd, move_type in filtered_candidate_pairs:
+                cand = self._solve_for_pair(
+                    Xn,
+                    D_geo_n,
+                    seed_days,
+                    seed_weights,
+                    cand_kn,
+                    cand_kd,
+                    node_loss_weights=node_loss_weights,
+                    node_cluster_weights=node_cluster_weights,
+                )
+                cand["move_type"] = move_type
+                candidate_solutions.append(cand)
+
+                if self.verbose:
+                    print(
+                        f"    candidate={move_type:>24s} | "
+                        f"K_nodes={cand['K_nodes']} | "
+                        f"K_days={cand['K_days']} | "
+                        f"steps={cand['total_steps']} | "
+                        f"objective={cand['objective']:.6e} | "
+                        f"beta={beta_used:.6f}"
+                    )
+
+            best_candidate = min(candidate_solutions, key=lambda s: float(s["objective"]))
+            best_obj = float(best_candidate["objective"])
+            candidate_info = _candidate_summary(candidate_solutions)
+
+            rel_improvement = (current_obj - best_obj) / max(abs(current_obj), 1e-12)
+
+            if best_obj < current_obj and rel_improvement > self.objective_tol_rel:
+                accepted_solution = best_candidate
+                _append_candidate_evaluations(
+                    evaluations,
+                    iter_id=int(it_global + 1),
+                    phase="feasible_search",
+                    current_solution=current_solution,
+                    candidate_solutions=candidate_solutions,
+                    beta=float(beta_used),
+                    accepted_solution=accepted_solution,
+                )
+                current_solution = best_candidate
+                no_improve_counter = 0
+
+                # After an accepted move, restart from the widest radius.
+                beta_current = beta_start
+
+                it_global += 1
+                it_feasible += 1
+
+                history.append(
+                    dict(
+                        iter=int(it_global),
+                        phase="feasible_search",
+                        status="accepted_feasible",
+
+                        previous_K_nodes=int(current_pair[0]),
+                        previous_K_days=int(current_pair[1]),
+                        previous_total_steps=int(current_pair[0] * current_pair[1]),
+                        previous_objective=float(current_obj),
+
+                        K_nodes=int(current_solution["K_nodes"]),
+                        K_days=int(current_solution["K_days"]),
+                        total_steps=int(current_solution["total_steps"]),
+                        objective=float(current_solution["objective"]),
+
+                        beta=float(beta_used),
+                        next_beta=float(beta_current),
+                        no_change=int(no_improve_counter),
+
+                        **candidate_info,
+
+                        accepted_candidate_K_nodes=int(current_solution["K_nodes"]),
+                        accepted_candidate_K_days=int(current_solution["K_days"]),
+                        accepted_candidate_total_steps=int(current_solution["total_steps"]),
+                        accepted_candidate_move_type=str(best_candidate.get("move_type", "")),
+                        accepted_candidate_objective=float(current_solution["objective"]),
+                        rel_improvement=float(rel_improvement),
+                    )
+                )
+
+                if self.verbose:
+                    print(
+                        f"[Iter {it_global}] accepted_feasible | "
+                        f"K_nodes={current_solution['K_nodes']} | "
+                        f"K_days={current_solution['K_days']} | "
+                        f"steps={current_solution['total_steps']} | "
+                        f"objective={current_solution['objective']:.6e} | "
+                        f"beta reset to {beta_current:.6f}"
+                    )
+
+            else:
+                no_improve_counter += 1
+
+                _append_candidate_evaluations(
+                    evaluations,
+                    iter_id=int(it_global + 1),
+                    phase="feasible_search",
+                    current_solution=current_solution,
+                    candidate_solutions=candidate_solutions,
+                    beta=float(beta_used),
+                    accepted_solution=None,
+                )
+
+                # No improvement: refine the local search radius.
+                beta_current = max(
+                    beta_min,
+                    beta_used / float(self.beta_growth),
+                )
+
+                history.append(
+                    dict(
+                        iter=int(it_global + 1),
+                        phase="feasible_search",
+                        status="no_improvement",
+
+                        K_nodes=int(current_solution["K_nodes"]),
+                        K_days=int(current_solution["K_days"]),
+                        total_steps=int(current_solution["total_steps"]),
+                        objective=float(current_solution["objective"]),
+
+                        beta=float(beta_used),
+                        next_beta=float(beta_current),
+                        no_change=int(no_improve_counter),
+
+                        **candidate_info,
+
+                        accepted_candidate_K_nodes=None,
+                        accepted_candidate_K_days=None,
+                        accepted_candidate_total_steps=None,
+                        accepted_candidate_move_type=None,
+                        accepted_candidate_objective=None,
+
+                        rel_improvement=float(rel_improvement),
+                    )
+                )
+
+                if self.verbose:
+                    print(
+                        f"[No improvement] best_candidate={best_obj:.6e} | "
+                        f"current={current_obj:.6e} | "
+                        f"rel_improvement={rel_improvement:.3e} | "
+                        f"beta={beta_used:.6f} | "
+                        f"next_beta={beta_current:.6f} | "
+                        f"no_change={no_improve_counter}"
+                    )
+
+                it_global += 1
+                it_feasible += 1
+
+                # Stop only after testing the finest beta.
+                if (
+                    no_improve_counter >= self.tol_no_change
+                    or beta_used <= beta_min + 1e-12
+                ):
+                    if self.verbose:
+                        print(
+                            f"[Converged] No relevant improvement. "
+                            f"beta={beta_used:.6f}, no_change={no_improve_counter}"
+                        )
+                    break
+
+        # Final hard guarantee
+        if int(current_solution["total_steps"]) > target_budget:
+            raise RuntimeError(
+                "The final solution is infeasible: "
+                f"total_steps={current_solution['total_steps']} > max_total_steps={target_budget}."
+            )
 
         return ReductionResult(
-            labels_nodes=labels_nodes,
-            labels_days=labels_days,
-            rep_days=rep_days.astype(int),
-            rep_weights=rep_weights.astype(int),
+            labels_nodes=current_solution["labels_nodes"].astype(int),
+            labels_days=current_solution["labels_days"].astype(int),
+            rep_nodes=current_solution["rep_nodes"].astype(int),
+            rep_node_weights=current_solution["rep_node_weights"].astype(float),
+            rep_days=current_solution["rep_days"].astype(int),
+            rep_weights=current_solution["rep_weights"].astype(int),
             history=history,
-            day_pca_info=last_day_pca_info,
-            region_membership=region_membership,
+            evaluations=evaluations,
+            day_pca_info=current_solution["day_pca_info"],
+            objective=float(current_solution["objective"]),
+            region_membership=None,
         )
 
 
 # =============================================================================
 # PyPSA helpers (feature extraction + mapping)
+# =============================================================================
 # =============================================================================
 
 def select_buses_from_loads(
@@ -962,6 +2178,69 @@ def loads_by_bus_timeseries(n, buses: List[str]) -> pd.DataFrame:
 
     return out
 
+def electric_demand_weights_by_bus(
+    n,
+    buses: List[str],
+    *,
+    use_snapshot_weightings: bool = True,
+    normalization: Literal["none", "sum", "mean", "max"] = "mean",
+    fallback_to_uniform: bool = True,
+) -> np.ndarray:
+    """
+    Build node weights proportional to total electric demand per selected bus.
+
+    The returned weights are aligned with `buses`.
+
+    Normalization modes
+    -------------------
+    - "none": return absolute demand weights.
+    - "sum": weights sum to 1.
+    - "mean": weights have mean 1.
+    - "max": maximum weight is 1.
+    """
+    load_ts = loads_by_bus_timeseries(n, buses).astype(float)
+
+    if use_snapshot_weightings and getattr(n, "snapshot_weightings", None) is not None:
+        if not n.snapshot_weightings.empty and "objective" in n.snapshot_weightings.columns:
+            sw = n.snapshot_weightings.reindex(load_ts.index)["objective"].astype(float)
+            weights = load_ts.mul(sw, axis=0).sum(axis=0)
+        else:
+            weights = load_ts.sum(axis=0)
+    else:
+        weights = load_ts.sum(axis=0)
+
+    weights = weights.reindex(buses).fillna(0.0).astype(float)
+    values = weights.to_numpy(dtype=float)
+
+    if np.any(values < 0):
+        raise ValueError("Electric demand weights must be non-negative.")
+
+    total = float(values.sum())
+
+    if total <= 0.0:
+        if fallback_to_uniform:
+            values = np.ones(len(buses), dtype=float)
+        else:
+            raise ValueError(
+                "Total electric demand weight is zero. Cannot build demand-based node weights."
+            )
+
+    if normalization == "none":
+        return values
+
+    if normalization == "sum":
+        denom = float(values.sum())
+    elif normalization == "mean":
+        denom = float(values.mean())
+    elif normalization == "max":
+        denom = float(values.max())
+    else:
+        raise ValueError("normalization must be one of: 'none', 'sum', 'mean', 'max'.")
+
+    if denom <= 0.0:
+        return np.ones(len(buses), dtype=float)
+
+    return values / denom
 
 def cf_by_bus_timeseries(
     n,
@@ -1068,40 +2347,281 @@ def build_full_busmap(
     return pd.Series(mapping, name="busmap").reindex(n.buses.index.astype(str))
 
 
+def _aggregate_temporal_dataframe_by_representative_days(
+    df: pd.DataFrame,
+    *,
+    snapshots: pd.Index,
+    labels_days: np.ndarray,
+    rep_days: np.ndarray,
+    hours_per_day: int,
+    representation: Literal["medoid", "mean", "medoid_scaled"] = "medoid",
+    clip_bounds: Optional[Tuple[float, float]] = None,
+) -> pd.DataFrame:
+    """
+    Aggregate a time-dependent PyPSA DataFrame onto representative days.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Time-dependent table with snapshots on rows.
+    snapshots : pd.Index
+        Original full snapshot index.
+    labels_days : np.ndarray
+        Day cluster label for each original day. Shape: (D,).
+    rep_days : np.ndarray
+        Representative day index for each cluster label. Shape: (K,).
+    hours_per_day : int
+        Number of snapshots per day.
+    representation : {"medoid", "mean", "medoid_scaled"}
+        - "medoid": keep the original representative-day values.
+        - "mean": replace each representative day with the hourly mean
+          of all days assigned to its cluster.
+        - "medoid_scaled": keep the medoid shape but rescale it so that
+          the weighted cluster total matches the original cluster total.
+    clip_bounds : tuple[float, float] | None
+        Optional lower/upper clipping bounds, useful for per-unit profiles.
+
+    Returns
+    -------
+    pd.DataFrame
+        Aggregated table indexed by the representative-day snapshots.
+    """
+    if df is None or df.empty:
+        return df
+
+    if len(df.index) != len(snapshots):
+        return df
+
+    labels_days = np.asarray(labels_days, dtype=int)
+    rep_days = np.asarray(rep_days, dtype=int)
+
+    T = len(snapshots)
+    if T % hours_per_day != 0:
+        raise ValueError(
+            f"Snapshots length {T} is not divisible by hours_per_day={hours_per_day}."
+        )
+
+    D = T // hours_per_day
+    if labels_days.shape != (D,):
+        raise ValueError(f"labels_days must have shape ({D},), got {labels_days.shape}.")
+
+    rep_days_sorted = np.sort(rep_days)
+    keep_idx = np.concatenate(
+        [
+            np.arange(d * hours_per_day, (d + 1) * hours_per_day)
+            for d in rep_days_sorted
+        ]
+    )
+    keep_snaps = snapshots[keep_idx]
+
+    if representation == "medoid":
+        out = df.reindex(index=keep_snaps).copy()
+        if clip_bounds is not None:
+            out = out.clip(lower=clip_bounds[0], upper=clip_bounds[1])
+        return out
+
+    out = df.reindex(index=keep_snaps).copy()
+
+    # Map representative day -> cluster label.
+    rep_day_to_cluster = {
+        int(rep_day): int(cluster_label)
+        for cluster_label, rep_day in enumerate(rep_days)
+    }
+
+    for rep_day in rep_days_sorted:
+        rep_day = int(rep_day)
+        cluster_label = rep_day_to_cluster[rep_day]
+
+        cluster_days = np.where(labels_days == cluster_label)[0].astype(int)
+        if len(cluster_days) == 0:
+            continue
+
+        for h in range(hours_per_day):
+            target_snap = snapshots[rep_day * hours_per_day + h]
+            source_snaps = snapshots[cluster_days * hours_per_day + h]
+
+            if representation == "mean":
+                out.loc[target_snap, :] = df.reindex(index=source_snaps).mean(axis=0)
+
+            elif representation == "medoid_scaled":
+                medoid_value = df.loc[target_snap, :].astype(float)
+                cluster_values = df.reindex(index=source_snaps).astype(float)
+
+                original_total = cluster_values.sum(axis=0)
+                medoid_total = medoid_value * float(len(cluster_days))
+
+                scale = pd.Series(1.0, index=df.columns, dtype=float)
+                nonzero = medoid_total.abs() > 1e-12
+
+                scale.loc[nonzero] = (
+                    original_total.loc[nonzero] / medoid_total.loc[nonzero]
+                )
+
+                # If the medoid is zero but the cluster is not, scaling cannot recover it.
+                # In that case, fall back to the cluster hourly mean.
+                fallback = (~nonzero) & (original_total.abs() > 1e-12)
+
+                new_value = medoid_value * scale
+                if fallback.any():
+                    new_value.loc[fallback] = cluster_values.loc[:, fallback].mean(axis=0)
+
+                out.loc[target_snap, :] = new_value
+
+            else:
+                raise ValueError(
+                    "representation must be one of: 'medoid', 'mean', 'medoid_scaled'."
+                )
+
+    if clip_bounds is not None:
+        out = out.clip(lower=clip_bounds[0], upper=clip_bounds[1])
+
+    return out
+
+
+def _iter_temporal_dataframes(n):
+    """
+    Yield common PyPSA time-dependent DataFrames that should be temporally aggregated.
+    """
+    candidates = [
+        ("generators_t", "p_max_pu", (0.0, 1.0)),
+        ("generators_t", "p_min_pu", (0.0, 1.0)),
+        ("generators_t", "p_set", None),
+        ("generators_t", "q_set", None),
+        ("generators_t", "marginal_cost", None),
+
+        ("loads_t", "p_set", None),
+        ("loads_t", "q_set", None),
+
+        ("storage_units_t", "inflow", None),
+        ("storage_units_t", "p_max_pu", (0.0, 1.0)),
+        ("storage_units_t", "p_min_pu", (0.0, 1.0)),
+        ("storage_units_t", "marginal_cost", None),
+
+        ("stores_t", "e_set", None),
+        ("stores_t", "p_set", None),
+        ("stores_t", "marginal_cost", None),
+
+        ("links_t", "p_set", None),
+        ("links_t", "p_max_pu", None),
+        ("links_t", "p_min_pu", None),
+        ("links_t", "efficiency", None),
+        ("links_t", "marginal_cost", None),
+
+        ("lines_t", "s_max_pu", (0.0, 1.0)),
+        ("transformers_t", "s_max_pu", (0.0, 1.0)),
+    ]
+
+    for container_name, attr_name, clip_bounds in candidates:
+        container = getattr(n, container_name, None)
+        if container is None:
+            continue
+
+        df = getattr(container, attr_name, None)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            yield container, attr_name, df, clip_bounds
+
+
 def apply_temporal_reduction(
     n,
     *,
     rep_days: np.ndarray,
     rep_weights: np.ndarray,
+    labels_days: Optional[np.ndarray] = None,
     hours_per_day: int = 24,
+    representation: Literal["medoid", "mean", "medoid_scaled"] = "medoid",
 ) -> None:
     """
-    In-place temporal reduction:
-    - Keep only snapshots corresponding to representative days.
-    - Multiply snapshot_weightings by the representative day weight (cardinality).
+    In-place temporal reduction.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify.
+    rep_days : np.ndarray
+        Representative day indices.
+    rep_weights : np.ndarray
+        Representative day weights, normally cluster sizes.
+    labels_days : np.ndarray | None
+        Day cluster labels for all original days. Required for "mean" and
+        "medoid_scaled" representations.
+    hours_per_day : int
+        Number of snapshots per day.
+    representation : {"medoid", "mean", "medoid_scaled"}
+        Temporal representation strategy.
+
+    Notes
+    -----
+    - "medoid" keeps the current behaviour.
+    - "mean" replaces each representative day with the cluster hourly mean.
+    - "medoid_scaled" preserves medoid shape but rescales cluster totals.
     """
     rep_days = np.asarray(rep_days, dtype=int)
     rep_weights = np.asarray(rep_weights, dtype=float)
 
-    snaps = n.snapshots
+    snaps = n.snapshots.copy()
     T = len(snaps)
     if T % hours_per_day != 0:
-        raise ValueError(f"Snapshots length {T} not divisible by hours_per_day={hours_per_day}.")
+        raise ValueError(
+            f"Snapshots length {T} not divisible by hours_per_day={hours_per_day}."
+        )
+
     D = T // hours_per_day
 
     if rep_days.min() < 0 or rep_days.max() >= D:
         raise ValueError("rep_days out of range.")
 
+    if representation not in {"medoid", "mean", "medoid_scaled"}:
+        raise ValueError(
+            "representation must be one of: 'medoid', 'mean', 'medoid_scaled'."
+        )
+
+    if representation != "medoid" and labels_days is None:
+        raise ValueError(
+            "labels_days must be provided when representation is "
+            f"'{representation}'."
+        )
+
+    if labels_days is not None:
+        labels_days = np.asarray(labels_days, dtype=int)
+        if labels_days.shape != (D,):
+            raise ValueError(f"labels_days must have shape ({D},), got {labels_days.shape}.")
+
     rep_days_sorted = np.sort(rep_days)
     keep_idx = np.concatenate(
-        [np.arange(d * hours_per_day, (d + 1) * hours_per_day) for d in rep_days_sorted]
+        [
+            np.arange(d * hours_per_day, (d + 1) * hours_per_day)
+            for d in rep_days_sorted
+        ]
     )
     keep_snaps = snaps[keep_idx]
 
-    day_weight_map = {int(d): float(w) for d, w in zip(rep_days, rep_weights)}
+    # Aggregate time-dependent data before changing the snapshot index.
+    aggregated_tables = []
+    for container, attr_name, df, clip_bounds in _iter_temporal_dataframes(n):
+        if labels_days is None:
+            agg = df.reindex(index=keep_snaps).copy()
+        else:
+            agg = _aggregate_temporal_dataframe_by_representative_days(
+                df,
+                snapshots=snaps,
+                labels_days=labels_days,
+                rep_days=rep_days,
+                hours_per_day=hours_per_day,
+                representation=representation,
+                clip_bounds=clip_bounds,
+            )
+
+        aggregated_tables.append((container, attr_name, agg))
+
+    day_weight_map = {
+        int(d): float(w)
+        for d, w in zip(rep_days, rep_weights)
+    }
+
     multipliers = []
     for d in rep_days_sorted:
         multipliers.extend([day_weight_map[int(d)]] * hours_per_day)
+
     mult = pd.Series(np.asarray(multipliers, dtype=float), index=keep_snaps)
 
     if getattr(n, "snapshot_weightings", None) is not None and not n.snapshot_weightings.empty:
@@ -1120,3 +2640,7 @@ def apply_temporal_reduction(
             n.snapshot_weightings[col].astype(float)
             * mult.reindex(n.snapshots).to_numpy()
         )
+
+    # Write aggregated time-dependent tables back after set_snapshots.
+    for container, attr_name, agg in aggregated_tables:
+        setattr(container, attr_name, agg.reindex(index=n.snapshots))

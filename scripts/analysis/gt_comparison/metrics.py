@@ -267,6 +267,115 @@ def build_missing_carriers_report(
 
     return rows
 
+def _sum_statistics_for_components(
+    statistics_result: pd.Series | pd.DataFrame,
+    components: list[str],
+) -> float:
+    """
+    Sum a PyPSA statistics output over selected components.
+
+    This function is intentionally defensive because PyPSA statistics outputs can
+    be Series or DataFrames depending on version and options.
+    """
+    if statistics_result is None:
+        return 0.0
+
+    if isinstance(statistics_result, (pd.Series, pd.DataFrame)) and statistics_result.empty:
+        return 0.0
+
+    component_set = set(components)
+
+    if isinstance(statistics_result, pd.Series):
+        if isinstance(statistics_result.index, pd.MultiIndex):
+            if "component" in statistics_result.index.names:
+                component_level = statistics_result.index.names.index("component")
+            else:
+                component_level = 0
+
+            component_values = statistics_result.index.get_level_values(component_level)
+            mask = component_values.isin(component_set)
+            return float(statistics_result.loc[mask].sum())
+
+        mask = statistics_result.index.astype(str).isin(component_set)
+        return float(statistics_result.loc[mask].sum())
+
+    if isinstance(statistics_result, pd.DataFrame):
+        if "component" in statistics_result.columns:
+            mask = statistics_result["component"].astype(str).isin(component_set)
+            numeric = statistics_result.loc[mask].select_dtypes(include=[np.number])
+            return float(numeric.sum().sum())
+
+        if isinstance(statistics_result.index, pd.MultiIndex):
+            if "component" in statistics_result.index.names:
+                component_level = statistics_result.index.names.index("component")
+            else:
+                component_level = 0
+
+            component_values = statistics_result.index.get_level_values(component_level)
+            mask = component_values.isin(component_set)
+            numeric = statistics_result.loc[mask].select_dtypes(include=[np.number])
+            return float(numeric.sum().sum())
+
+        mask = statistics_result.index.astype(str).isin(component_set)
+        numeric = statistics_result.loc[mask].select_dtypes(include=[np.number])
+        return float(numeric.sum().sum())
+
+    return 0.0
+
+
+def compute_component_capex_opex_from_statistics(
+    n,
+    components: list[str],
+) -> tuple[float, float]:
+    """
+    Compute capex and opex for selected components using n.statistics.
+
+    Returns
+    -------
+    capex, opex
+    """
+    capex = 0.0
+    opex = 0.0
+
+    try:
+        capex_result = n.statistics.capex()
+        capex = _sum_statistics_for_components(capex_result, components)
+    except Exception as exc:
+        print(
+            "[WARNING] Could not compute component capex from n.statistics.capex(). "
+            f"Components: {components}. Error: {exc}"
+        )
+
+    try:
+        opex_result = n.statistics.opex()
+        opex = _sum_statistics_for_components(opex_result, components)
+    except Exception as exc:
+        print(
+            "[WARNING] Could not compute component opex from n.statistics.opex(). "
+            f"Components: {components}. Error: {exc}"
+        )
+
+    return capex, opex
+
+
+def compute_objective_without_component_costs(
+    n,
+    components: list[str],
+) -> dict[str, float]:
+    """
+    Compute objective corrected by removing capex and opex of selected components.
+    """
+    objective = compute_objective(n)
+    capex, opex = compute_component_capex_opex_from_statistics(n, components)
+    removed_cost = capex + opex
+
+    return {
+        "objective": objective,
+        "removed_component_capex": capex,
+        "removed_component_opex": opex,
+        "removed_component_total_cost": removed_cost,
+        "objective_without_removed_component_cost": objective - removed_cost,
+    }
 
 def collect_metrics_for_network(
     n,
@@ -297,6 +406,25 @@ def collect_metrics_for_network(
 
     if metrics_cfg.get("objective", True):
         summary["objective"] = compute_objective(n)
+
+        objective_correction_cfg = config.get("objective_correction", {})
+        if objective_correction_cfg.get("enabled", False):
+            excluded_components = objective_correction_cfg.get(
+                "exclude_components",
+                ["Line"],
+            )
+
+            corrected = compute_objective_without_component_costs(
+                n=n,
+                components=excluded_components,
+            )
+
+            summary["line_excluded_capex"] = corrected["removed_component_capex"]
+            summary["line_excluded_opex"] = corrected["removed_component_opex"]
+            summary["line_excluded_total_cost"] = corrected["removed_component_total_cost"]
+            summary["objective_without_line_cost"] = corrected[
+                "objective_without_removed_component_cost"
+            ]
 
     if metrics_cfg.get("demand", True):
         summary["total_demand"] = compute_total_demand(n, weights)

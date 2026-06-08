@@ -53,7 +53,7 @@ from scripts.geo_temporal_clustering.core import (
 
 NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/reference_nuts3/complete/networks/base_s_adm_elec_.nc")
 
-OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_max_energy")
+OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean")
 
 # Main scan parameters
 TARGET_BUDGET = 400

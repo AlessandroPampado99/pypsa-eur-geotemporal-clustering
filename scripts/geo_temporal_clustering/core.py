@@ -883,6 +883,49 @@ def reconstruct_tensor_from_medoids(
 
     return X[node_src[:, None], day_src[None, :], :]
 
+def reconstruct_tensor_from_medoids_temporal_mean(
+    X: np.ndarray,
+    *,
+    rep_nodes: np.ndarray,
+    labels_nodes: np.ndarray,
+    labels_days: np.ndarray,
+) -> np.ndarray:
+    """
+    Reconstruct X[N,D,F] using spatial medoids and temporal cluster means.
+
+    For each original pair (n, d), the reconstructed value is:
+    mean over all days assigned to labels_days[d], evaluated at the spatial
+    medoid of node n's cluster.
+
+    This is useful when the final temporal representation is "mean", because
+    the clustering objective becomes consistent with the temporal aggregation.
+    """
+    X = np.asarray(X, dtype=float)
+    rep_nodes = np.asarray(rep_nodes, dtype=int)
+    labels_nodes = np.asarray(labels_nodes, dtype=int)
+    labels_days = np.asarray(labels_days, dtype=int)
+
+    N, D, F = X.shape
+
+    if labels_nodes.shape != (N,):
+        raise ValueError("labels_nodes must have shape (N,).")
+    if labels_days.shape != (D,):
+        raise ValueError("labels_days must have shape (D,).")
+
+    node_src = rep_nodes[labels_nodes]
+
+    X_rec = np.empty_like(X)
+
+    for c_day in np.unique(labels_days):
+        day_idx = np.where(labels_days == c_day)[0]
+
+        # Mean profile of each spatial medoid over the days in this temporal cluster.
+        # Shape: (N, F), after selecting node_src.
+        cluster_mean = X[np.ix_(node_src, day_idx)].mean(axis=1)
+
+        X_rec[:, day_idx, :] = cluster_mean[:, None, :]
+
+    return X_rec
 
 def weighted_reconstruction_loss(
     X: np.ndarray,
@@ -1252,11 +1295,10 @@ class AlternatingSpatioTemporalReducer:
         labels_days = _relabel_contiguous(labels_days)
         rep_weights = _cluster_sizes_from_labels(labels_days)
 
-        X_rec = reconstruct_tensor_from_medoids(
+        X_rec = reconstruct_tensor_from_medoids_temporal_mean(
             Xn,
             rep_nodes=rep_nodes,
             labels_nodes=labels_nodes,
-            rep_days=rep_days,
             labels_days=labels_days,
         )
         objective = weighted_reconstruction_loss(

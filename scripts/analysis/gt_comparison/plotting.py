@@ -540,6 +540,145 @@ def plot_optimization_vs_clustering_objective(
     save_figure(fig, plots_dir / filename, config)
     plt.close(fig)
 
+def plot_optimization_without_line_cost_vs_clustering_objective(
+    df: pd.DataFrame,
+    plots_dir: Path,
+    config: dict[str, Any],
+) -> None:
+    """
+    Plot optimization objective without line costs and clustering objective.
+
+    The corrected optimization objective removes capex and opex of selected
+    components, typically Lines, from the original optimization objective.
+    """
+    objective_column = "objective_without_line_cost"
+
+    required = {
+        objective_column,
+        "clustering_objective",
+        "n_nodes",
+        "n_days",
+        "scan_type",
+        "run",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        print(
+            "[WARNING] Missing columns for corrected objective comparison plot: "
+            f"{sorted(missing)}. Skipping."
+        )
+        return
+
+    reference_run = config.get("reference", {}).get("run", "complete")
+    reference_df = df[df["run"] == reference_run].copy()
+
+    optimization_reference = None
+    if not reference_df.empty and reference_df[objective_column].notna().any():
+        optimization_reference = float(reference_df[objective_column].dropna().iloc[0])
+
+    plot_df = df[df["scan_type"] == "budget_scan"].copy()
+
+    if plot_df.empty:
+        plot_df = df[df["scan_type"] != "complete"].copy()
+        filename_suffix = "reduced_scan"
+        title_suffix = "all reduced runs"
+    else:
+        filename_suffix = "budget_scan"
+        title_suffix = "constant geo-temporal budget"
+
+    plot_df = plot_df.dropna(
+        subset=[objective_column, "clustering_objective", "n_nodes", "n_days"]
+    )
+    plot_df = plot_df.sort_values("n_nodes")
+
+    if plot_df.empty:
+        print(
+            "[WARNING] No runs have both corrected optimization and clustering objectives. "
+            "Skipping corrected objective comparison plot."
+        )
+        return
+
+    filename = sanitize_filename(
+        f"optimization_without_line_cost_vs_clustering_objective_2d_{filename_suffix}"
+    )
+
+    export_plot_data(
+        plot_df=plot_df,
+        plots_dir=plots_dir,
+        filename=filename,
+    )
+
+    fig, ax1 = plt.subplots(figsize=(8.6, 5.5))
+
+    optimization_color = "tab:green"
+    clustering_color = "tab:orange"
+    reference_color = "black"
+
+    line1 = ax1.plot(
+        plot_df["n_nodes"],
+        plot_df[objective_column],
+        marker="o",
+        linewidth=1.8,
+        color=optimization_color,
+        label="Optimization objective without line costs",
+    )
+
+    reference_line = []
+    if optimization_reference is not None:
+        reference_line = [
+            ax1.axhline(
+                optimization_reference,
+                linewidth=1.2,
+                linestyle="--",
+                color=reference_color,
+                label="Complete optimization objective without line costs",
+            )
+        ]
+
+    ax1.set_xlabel("Number of nodes", fontweight="bold")
+    ax1.set_ylabel(
+        "Optimization objective without line costs",
+        fontweight="bold",
+        color=optimization_color,
+    )
+    ax1.tick_params(axis="y", labelcolor=optimization_color)
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+
+    line2 = ax2.plot(
+        plot_df["n_nodes"],
+        plot_df["clustering_objective"],
+        marker="s",
+        linewidth=1.8,
+        linestyle="--",
+        color=clustering_color,
+        label="Clustering objective",
+    )
+
+    ax2.set_ylabel("Clustering objective", fontweight="bold", color=clustering_color)
+    ax2.tick_params(axis="y", labelcolor=clustering_color)
+
+    add_budget_secondary_xaxis(
+        ax=ax1,
+        plot_df=plot_df,
+        x_col="n_nodes",
+        days_col="n_days",
+    )
+
+    lines = line1 + line2 + reference_line
+    labels = [line.get_label() for line in lines]
+    ax1.legend(lines, labels, frameon=False)
+
+    ax1.set_title(
+        f"Optimization objective without line costs vs clustering objective - {title_suffix}",
+        fontweight="bold",
+    )
+
+    fig.tight_layout()
+    save_figure(fig, plots_dir / filename, config)
+    plt.close(fig)
+
 def plot_metric_3d(
     df: pd.DataFrame,
     metric: str,

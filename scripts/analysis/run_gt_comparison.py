@@ -36,8 +36,8 @@ from gt_comparison.plotting import (
     plot_capacity_heatmaps,
     plot_budget_combined_relative_profiles,
     plot_optimization_vs_clustering_objective,
+    plot_optimization_without_line_cost_vs_clustering_objective,
 )
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -226,6 +226,13 @@ def main() -> None:
 
         if plot_config.get("make_objective_comparison", True):
             plot_optimization_vs_clustering_objective(
+                df=metrics_summary,
+                plots_dir=plots_dir,
+                config=config,
+            )
+
+        if plot_config.get("make_objective_without_line_cost_comparison", True):
+            plot_optimization_without_line_cost_vs_clustering_objective(
                 df=metrics_summary,
                 plots_dir=plots_dir,
                 config=config,

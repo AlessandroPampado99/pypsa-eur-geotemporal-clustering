@@ -1,7 +1,7 @@
 paths:
   root_dir: "/home/pampado/clustering/pypsa-eur"
-  runs_dir: "results/reference_nuts3_mean_400"
-  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_400_mean"
+  runs_dir: "results/reference_nuts3_mean_400_realmean"
+  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_400_mean_nolineexpansion"
 
 network:
   # Flexible template. Available placeholders:
@@ -32,7 +32,7 @@ clustering:
   #   results/reference_nuts3_mean_400_noseasonal/<run>/networks/base_s_adm_elec_Gt.nc
   # Clustering history:
   #   resources/reference_nuts3_mean_400_noseasonal/<run>/geotemporal_clustering/history.csv
-  resources_dir: "resources/reference_nuts3_mean_400"
+  resources_dir: "resources/reference_nuts3_mean_400_nolineexpansion"
 
   history_filename: "history.csv"
   objective_column: "objective"
@@ -99,6 +99,15 @@ capacity:
       attribute: "s_nom_opt"
       fallback_attribute: "s_nom"
 
+objective_correction:
+  enabled: true
+
+  # Components whose capex + opex should be removed from the optimization objective.
+  # Default is only Line. Add Transformer if needed.
+  # Be careful with Link: in PyPSA-Eur it also includes converters, electrolysers, etc.
+  exclude_components:
+    - Line
+
 plots:
   enabled: true
   dpi: 300
@@ -114,6 +123,7 @@ plots:
   # Additional plots.
   make_budget_combined: true
   make_objective_comparison: true
+  make_objective_without_line_cost_comparison: true
 
   # Possible values: absolute, delta, relative_delta
   plot_values:
@@ -132,6 +142,7 @@ plots:
     - storage_unit_power_capacity
     - link_power_capacity
     - line_capacity
+
 
   # Combined percentage plot along budget_scan.
   # All these are plotted as *_relative_delta [%].

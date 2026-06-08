@@ -20,11 +20,11 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "reference_nuts3_mean_400_realmean"
+  prefix: "reference_nuts3_mean_900_nolineexpansion"
   name: all
   scenarios:
     enable: true
-    file: config/clustering_validation/scenarios_validation_400.yaml
+    file: config/clustering_validation/scenarios_validation.yaml
   disable_progressbar: false
   shared_resources:
     policy: false
@@ -140,7 +140,7 @@ electricity:
   autarky:
     enable: false
     by_country: false
-  transmission_limit: vopt
+  transmission_limit: v0
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#atlite
 atlite:

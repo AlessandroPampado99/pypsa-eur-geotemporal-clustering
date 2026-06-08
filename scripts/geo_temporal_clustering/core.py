@@ -674,6 +674,7 @@ class ReductionResult:
     day_pca_info: dict
     objective: float
     region_membership: Optional[pd.Series] = None
+    objective_breakdown: Optional[dict] = None
 
 
 def _relabel_contiguous(labels: np.ndarray) -> np.ndarray:
@@ -927,25 +928,53 @@ def reconstruct_tensor_from_medoids_temporal_mean(
 
     return X_rec
 
-def weighted_reconstruction_loss(
+def _split_feature_name(feature_name: str) -> Tuple[str, str]:
+    """
+    Split a feature name into attribute and statistic.
+
+    Examples
+    --------
+    - load_mean -> ("load", "mean")
+    - pv_cf_ramp_max -> ("pv_cf", "ramp_max")
+    - wind_cf_std -> ("wind_cf", "std")
+    """
+    known_stats = (
+        "ramp_max",
+        "energy",
+        "mean",
+        "max",
+        "min",
+        "std",
+    )
+
+    for stat in known_stats:
+        suffix = "_" + stat
+        if feature_name.endswith(suffix):
+            return feature_name[: -len(suffix)], stat
+
+    return feature_name, "unknown"
+
+
+def weighted_reconstruction_loss_breakdown(
     X: np.ndarray,
     X_rec: np.ndarray,
     *,
     feature_weights: Optional[np.ndarray] = None,
     node_loss_weights: Optional[np.ndarray] = None,
+    feature_names: Optional[List[str]] = None,
     loss_norm: Literal["l1", "l2_squared"] = "l2_squared",
-) -> float:
+) -> dict:
     """
-    Weighted reconstruction loss on X[N,D,F].
+    Compute the weighted reconstruction loss and decompose it.
 
-    Supported losses:
-    - "l2_squared":
-        sum_n w_n * sum_f w_f * sum_d (X - X_rec)^2
+    The scalar objective is exactly consistent with weighted_reconstruction_loss:
+        objective = sum_n w_n * sum_d sum_f w_f * loss(X[n,d,f], X_rec[n,d,f])
 
-    - "l1":
-        sum_n w_n * sum_f w_f * sum_d |X - X_rec|
-
-    Feature weights and node weights are internally normalized to have mean 1.
+    Returned decomposition:
+    - by_feature: contribution of each individual feature.
+    - by_attribute: contribution grouped by attribute, e.g. load, pv_cf, wind_cf.
+    - by_stat: contribution grouped by statistic, e.g. mean, max, std, ramp_max.
+    - shares: same groups divided by the total objective.
     """
     X = np.asarray(X, dtype=float)
     X_rec = np.asarray(X_rec, dtype=float)
@@ -953,7 +982,16 @@ def weighted_reconstruction_loss(
     if X.shape != X_rec.shape:
         raise ValueError("X and X_rec must have the same shape.")
 
-    N, _, F = X.shape
+    N, D, F = X.shape
+
+    if feature_names is None:
+        feature_names = [f"feature_{i}" for i in range(F)]
+    else:
+        feature_names = list(feature_names)
+        if len(feature_names) != F:
+            raise ValueError(
+                f"feature_names must have length {F}, got {len(feature_names)}."
+            )
 
     if loss_norm == "l2_squared":
         err = (X - X_rec) ** 2
@@ -982,10 +1020,82 @@ def weighted_reconstruction_loss(
             raise ValueError("node_loss_weights must be non-negative.")
         wn = wn / (wn.mean() + 1e-12)
 
-    err = err * wf[None, None, :]
-    err = err.sum(axis=(1, 2))
+    # Contribution by node and feature, after summing over days.
+    # Shape: (N, F)
+    err_node_feature = err.sum(axis=1) * wf[None, :]
 
-    return float(np.sum(wn * err))
+    # Apply node weights and sum over nodes.
+    # Shape: (F,)
+    by_feature_values = (err_node_feature * wn[:, None]).sum(axis=0)
+
+    objective = float(by_feature_values.sum())
+
+    by_feature = {
+        str(name): float(value)
+        for name, value in zip(feature_names, by_feature_values)
+    }
+
+    by_attribute: Dict[str, float] = {}
+    by_stat: Dict[str, float] = {}
+
+    for name, value in by_feature.items():
+        attribute, stat = _split_feature_name(name)
+        by_attribute[attribute] = by_attribute.get(attribute, 0.0) + float(value)
+        by_stat[stat] = by_stat.get(stat, 0.0) + float(value)
+
+    denom = objective + 1e-12
+
+    share_by_feature = {
+        key: float(value / denom)
+        for key, value in by_feature.items()
+    }
+    share_by_attribute = {
+        key: float(value / denom)
+        for key, value in by_attribute.items()
+    }
+    share_by_stat = {
+        key: float(value / denom)
+        for key, value in by_stat.items()
+    }
+
+    return {
+        "objective": objective,
+        "loss_norm": str(loss_norm),
+        "by_feature": by_feature,
+        "by_attribute": by_attribute,
+        "by_stat": by_stat,
+        "share_by_feature": share_by_feature,
+        "share_by_attribute": share_by_attribute,
+        "share_by_stat": share_by_stat,
+        "feature_weights_normalized": {
+            str(name): float(value)
+            for name, value in zip(feature_names, wf)
+        },
+    }
+
+
+def weighted_reconstruction_loss(
+    X: np.ndarray,
+    X_rec: np.ndarray,
+    *,
+    feature_weights: Optional[np.ndarray] = None,
+    node_loss_weights: Optional[np.ndarray] = None,
+    loss_norm: Literal["l1", "l2_squared"] = "l2_squared",
+) -> float:
+    """
+    Weighted reconstruction loss on X[N,D,F].
+
+    This wrapper preserves the original scalar API.
+    """
+    out = weighted_reconstruction_loss_breakdown(
+        X,
+        X_rec,
+        feature_weights=feature_weights,
+        node_loss_weights=node_loss_weights,
+        feature_names=None,
+        loss_norm=loss_norm,
+    )
+    return float(out["objective"])
 
 def _candidate_summary(candidate_solutions: List[dict]) -> dict:
     """
@@ -1149,6 +1259,7 @@ class AlternatingSpatioTemporalReducer:
         regions_gdf: Optional[gpd.GeoDataFrame] = None,
         region_name_col: str = "name",
         feature_weights: Optional[np.ndarray] = None,
+        feature_names: Optional[List[str]] = None,
     ):
         self.reduction_mode = str(reduction_mode)
         self.fixed_nodes = None if fixed_nodes is None else int(fixed_nodes)
@@ -1183,6 +1294,7 @@ class AlternatingSpatioTemporalReducer:
         self.region_name_col = str(region_name_col)
 
         self.feature_weights = feature_weights
+        self.feature_names = feature_names
 
     def _balanced_pair(self, N: int, D: int, budget: int) -> Tuple[int, int]:
         """Find a near-balanced integer pair (K_nodes, K_days) under the budget."""
@@ -1301,13 +1413,15 @@ class AlternatingSpatioTemporalReducer:
             labels_nodes=labels_nodes,
             labels_days=labels_days,
         )
-        objective = weighted_reconstruction_loss(
+        objective_breakdown = weighted_reconstruction_loss_breakdown(
             Xn,
             X_rec,
             feature_weights=self.feature_weights,
             node_loss_weights=node_loss_weights,
+            feature_names=self.feature_names,
             loss_norm=self.loss_norm,
         )
+        objective = float(objective_breakdown["objective"])
 
         return dict(
             K_nodes=int(K_nodes),
@@ -1321,6 +1435,7 @@ class AlternatingSpatioTemporalReducer:
             objective=float(objective),
             day_pca_info=day_pca_info,
             total_steps=int(K_nodes * K_days),
+            objective_breakdown=objective_breakdown,
         )
 
     def _candidate_pairs_reduce_budget(
@@ -1615,6 +1730,7 @@ class AlternatingSpatioTemporalReducer:
                 day_pca_info=current_solution["day_pca_info"],
                 objective=float(current_solution["objective"]),
                 region_membership=None,
+                objective_breakdown=current_solution.get("objective_breakdown", None),
             )
 
         target_budget = min(self.max_total_steps, N * D)
@@ -2111,6 +2227,7 @@ class AlternatingSpatioTemporalReducer:
             day_pca_info=current_solution["day_pca_info"],
             objective=float(current_solution["objective"]),
             region_membership=None,
+            objective_breakdown=current_solution.get("objective_breakdown", None),
         )
 
 

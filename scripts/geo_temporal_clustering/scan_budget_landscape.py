@@ -41,7 +41,8 @@ from scripts.geo_temporal_clustering.core import (
     loads_by_bus_timeseries,
     electric_demand_weights_by_bus,
     cf_by_bus_timeseries,
-    reconstruct_tensor_from_medoids,
+    reconstruct_tensor_from_medoids_temporal_mean,
+    weighted_reconstruction_loss_breakdown,
     zscore_global,
     minmax_global,
 )
@@ -53,7 +54,7 @@ from scripts.geo_temporal_clustering.core import (
 
 NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/reference_nuts3/complete/networks/base_s_adm_elec_.nc")
 
-OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean")
+OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean_load0.75")
 
 # Main scan parameters
 TARGET_BUDGET = 400
@@ -97,9 +98,9 @@ WIND_WEIGHT_BY = "p_nom"
 # - exact feature name, e.g. "load_mean"
 # - attribute prefix, e.g. "load", "pv_cf", "wind_cf"
 FEATURE_WEIGHTS_CFG = {
-    "load": 2.0,
-    "pv_cf": 1.0,
-    "wind_cf": 1.0,
+    "load": 1.0,
+    "pv_cf": 2.0,
+    "wind_cf": 2.0,
 }
 
 # Supported: None, "none", "mean_load", "peak_load", "electric_demand"
@@ -195,6 +196,26 @@ def build_feature_weights(feature_names: List[str], cfg_weights: Dict[str, float
 
     return weights
 
+def split_feature_name_for_scan(feature_name: str) -> Tuple[str, str]:
+    """
+    Split feature names such as load_mean, pv_cf_ramp_max, wind_cf_std.
+    """
+    known_stats = (
+        "ramp_max",
+        "energy",
+        "mean",
+        "max",
+        "min",
+        "std",
+    )
+
+    for stat in known_stats:
+        suffix = "_" + stat
+        if feature_name.endswith(suffix):
+            return feature_name[: -len(suffix)], stat
+
+    return feature_name, "unknown"
+
 def compute_feature_loss_breakdown(
     *,
     X: np.ndarray,
@@ -211,15 +232,14 @@ def compute_feature_loss_breakdown(
     """
     Compute the reducer reconstruction loss contribution feature by feature.
 
-    This mirrors the reducer objective:
+    This mirrors the current reducer objective:
     - X is normalized first using the same normalization mode;
-    - reconstruction is medoid-based;
+    - spatial reconstruction uses node medoids;
+    - temporal reconstruction uses temporal cluster means;
     - feature weights are normalized to mean 1;
-    - node weights are normalized to mean 1;
-    - loss can be l2_squared or l1.
+    - node weights are normalized to mean 1.
     """
     X = np.asarray(X, dtype=float)
-    N, D, F = X.shape
 
     if normalize == "zscore":
         Xn = zscore_global(X)
@@ -228,67 +248,54 @@ def compute_feature_loss_breakdown(
     else:
         raise ValueError("normalize must be either 'zscore' or 'minmax'.")
 
-    X_rec = reconstruct_tensor_from_medoids(
+    X_rec = reconstruct_tensor_from_medoids_temporal_mean(
         Xn,
         rep_nodes=np.asarray(rep_nodes, dtype=int),
         labels_nodes=np.asarray(labels_nodes, dtype=int),
-        rep_days=np.asarray(rep_days, dtype=int),
         labels_days=np.asarray(labels_days, dtype=int),
     )
 
-    if loss_norm == "l2_squared":
-        err = (Xn - X_rec) ** 2
-    elif loss_norm == "l1":
-        err = np.abs(Xn - X_rec)
-    else:
-        raise ValueError("loss_norm must be either 'l1' or 'l2_squared'.")
-
-    wf = np.asarray(feature_weights, dtype=float)
-    if wf.shape != (F,):
-        raise ValueError(f"feature_weights must have shape ({F},), got {wf.shape}.")
-    if np.any(wf < 0):
-        raise ValueError("feature_weights must be non-negative.")
-    wf_norm = wf / (wf.mean() + 1e-12)
-
-    if node_weights is None:
-        wn_norm = np.ones(N, dtype=float)
-    else:
-        wn = np.asarray(node_weights, dtype=float)
-        if wn.shape != (N,):
-            raise ValueError(f"node_weights must have shape ({N},), got {wn.shape}.")
-        if np.any(wn < 0):
-            raise ValueError("node_weights must be non-negative.")
-        wn_norm = wn / (wn.mean() + 1e-12)
+    breakdown = weighted_reconstruction_loss_breakdown(
+        Xn,
+        X_rec,
+        feature_weights=feature_weights,
+        node_loss_weights=node_weights,
+        feature_names=feature_names,
+        loss_norm=loss_norm,
+    )
 
     rows = []
-    for f, name in enumerate(feature_names):
-        # Loss contribution of feature f:
-        # sum_n w_n * sum_d err[n,d,f] * normalized_feature_weight[f]
-        loss_unweighted = float(err[:, :, f].sum())
-        loss_node_weighted = float((err[:, :, f].sum(axis=1) * wn_norm).sum())
-        loss_weighted = float(loss_node_weighted * wf_norm[f])
+
+    by_feature = breakdown["by_feature"]
+    share_by_feature = breakdown["share_by_feature"]
+    feature_weights_normalized = breakdown["feature_weights_normalized"]
+
+    for feature in feature_names:
+        feature = str(feature)
+        family, stat = split_feature_name_for_scan(feature)
 
         rows.append(
             {
-                "feature": str(name),
-                "feature_weight_raw": float(wf[f]),
-                "feature_weight_normalized": float(wf_norm[f]),
-                "loss_unweighted": loss_unweighted,
-                "loss_node_weighted": loss_node_weighted,
-                "loss_weighted": loss_weighted,
+                "feature": feature,
+                "feature_family": family,
+                "stat": stat,
+                "feature_weight_raw": float(
+                    feature_weights[feature_names.index(feature)]
+                ),
+                "feature_weight_normalized": float(
+                    feature_weights_normalized[feature]
+                ),
+                "loss_weighted": float(by_feature[feature]),
+                "loss_share": float(share_by_feature[feature]),
+                "objective_from_breakdown": float(breakdown["objective"]),
             }
         )
 
-    out = pd.DataFrame(rows)
-    total = float(out["loss_weighted"].sum())
-    out["loss_share"] = out["loss_weighted"] / (total + 1e-12)
-
-    # Useful grouped fields, e.g. load_mean -> variable=load, stat=mean
-    parts = out["feature"].str.rsplit("_", n=1, expand=True)
-    out["feature_family"] = parts[0]
-    out["stat"] = parts[1]
-
-    return out.sort_values("loss_weighted", ascending=False).reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values("loss_weighted", ascending=False)
+        .reset_index(drop=True)
+    )
 
 def build_scan_pairs(
     *,
@@ -766,6 +773,7 @@ def run_one_reducer(
         kmedoids_max_iter=int(REDUCER_BASE_CFG["kmedoids_max_iter"]),
         random_state=int(random_state),
         feature_weights=feature_weights,
+        feature_names=feature_names,
     )
 
     t0 = time.perf_counter()

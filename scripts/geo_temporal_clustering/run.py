@@ -268,6 +268,7 @@ def main() -> None:
         regions_gdf=regions_gdf,
         region_name_col=region_name_col,
         feature_weights=feature_weights,
+        feature_names=feat_names,
     )
 
     # ---------------------------------------------------------------------
@@ -429,6 +430,37 @@ def main() -> None:
         pd.DataFrame(result.history).to_csv(outdir / "history.csv", index=False)
     if len(result.evaluations) > 0:
         pd.DataFrame(result.evaluations).to_csv(outdir / "evaluations.csv", index=False)
+        # Objective breakdown
+    if result.objective_breakdown is not None:
+        rows = []
+
+        for group_name, values in result.objective_breakdown.items():
+            if not isinstance(values, dict):
+                continue
+
+            for key, value in values.items():
+                rows.append(
+                    {
+                        "group": str(group_name),
+                        "key": str(key),
+                        "value": float(value),
+                        "objective": float(result.objective),
+                        "share_of_objective": (
+                            float(value) / (float(result.objective) + 1e-12)
+                            if not str(group_name).startswith("share_")
+                            and str(group_name) != "feature_weights_normalized"
+                            else np.nan
+                        ),
+                        "K_nodes": int(len(np.unique(result.labels_nodes))),
+                        "K_days": int(len(np.unique(result.labels_days))),
+                        "total_steps": int(
+                            len(np.unique(result.labels_nodes))
+                            * len(np.unique(result.labels_days))
+                        ),
+                    }
+                )
+
+        pd.DataFrame(rows).to_csv(outdir / "objective_breakdown.csv", index=False)
 
     # Summary
     summary = {
@@ -448,6 +480,7 @@ def main() -> None:
         "max_total_steps": int(_cfg_get(r_cfg, "max_total_steps", 144)),
         "actual_total_steps": int(len(np.unique(result.labels_nodes)) * len(np.unique(result.labels_days))),
         "objective": float(result.objective),
+        "objective_breakdown": result.objective_breakdown,
         "feature_names": feat_names,
         "feature_weights": feature_weights.tolist(),
         "spatial_adjacency_enabled": bool(enforce_spatial_adjacency),

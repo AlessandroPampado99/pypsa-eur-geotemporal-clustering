@@ -689,6 +689,47 @@ def _relabel_contiguous(labels: np.ndarray) -> np.ndarray:
         out[i] = mapping[int(val)]
     return out.astype(int)
 
+def _assert_representatives_match_labels(
+    labels: np.ndarray,
+    representatives: np.ndarray,
+    *,
+    name: str,
+) -> None:
+    """
+    Ensure that each representative belongs to the cluster it represents.
+
+    This invariant must hold:
+        labels[representatives[k]] == k
+    """
+    labels = np.asarray(labels, dtype=int)
+    representatives = np.asarray(representatives, dtype=int)
+
+    if labels.size == 0:
+        if representatives.size != 0:
+            raise RuntimeError(f"{name}: empty labels but non-empty representatives.")
+        return
+
+    K = int(labels.max()) + 1
+
+    if representatives.shape != (K,):
+        raise RuntimeError(
+            f"{name}: representatives must have shape ({K},), "
+            f"got {representatives.shape}."
+        )
+
+    for k, rep in enumerate(representatives):
+        rep = int(rep)
+
+        if rep < 0 or rep >= labels.size:
+            raise RuntimeError(
+                f"{name}: representative {rep} for cluster {k} is out of range."
+            )
+
+        if int(labels[rep]) != int(k):
+            raise RuntimeError(
+                f"{name}: representative-label mismatch for cluster {k}. "
+                f"representative={rep}, labels[representative]={labels[rep]}."
+            )
 
 def _cluster_sizes_from_labels(labels: np.ndarray) -> np.ndarray:
     """Return cluster sizes for contiguous labels."""
@@ -708,10 +749,13 @@ def _cluster_weight_sums_from_labels(
     Otherwise, each cluster weight is the sum of the initial node weights
     assigned to that cluster.
     """
-    labels = _relabel_contiguous(labels)
+    labels = np.asarray(labels, dtype=int)
 
     if labels.size == 0:
         return np.zeros(0, dtype=float)
+
+    if labels.min() < 0:
+        raise ValueError("labels must be non-negative.")
 
     K = int(labels.max()) + 1
 
@@ -1268,7 +1312,12 @@ class AlternatingSpatioTemporalReducer:
             max_iter=self.kmedoids_max_iter,
             random_state=self.random_state,
         )
-        labels_nodes = _relabel_contiguous(labels_nodes)
+
+        _assert_representatives_match_labels(
+            labels_nodes,
+            rep_nodes,
+            name="nodes",
+        )
 
         rep_node_weights = _cluster_weight_sums_from_labels(
             labels_nodes,
@@ -1292,7 +1341,13 @@ class AlternatingSpatioTemporalReducer:
             max_iter=self.kmedoids_max_iter,
             random_state=self.random_state,
         )
-        labels_days = _relabel_contiguous(labels_days)
+
+        _assert_representatives_match_labels(
+            labels_days,
+            rep_days,
+            name="days",
+        )
+
         rep_weights = _cluster_sizes_from_labels(labels_days)
 
         X_rec = reconstruct_tensor_from_medoids_temporal_mean(
@@ -1307,6 +1362,17 @@ class AlternatingSpatioTemporalReducer:
             feature_weights=self.feature_weights,
             node_loss_weights=node_loss_weights,
             loss_norm=self.loss_norm,
+        )
+
+        _assert_representatives_match_labels(
+            labels_nodes,
+            rep_nodes,
+            name="nodes/final",
+        )
+        _assert_representatives_match_labels(
+            labels_days,
+            rep_days,
+            name="days/final",
         )
 
         return dict(

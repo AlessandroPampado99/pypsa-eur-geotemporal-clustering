@@ -20,11 +20,11 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "reference_nuts3_mean_900_nolineexpansion"
+  prefix: "reference_nuts3_mean_400_nolineexpansion_convergence"
   name: all
   scenarios:
     enable: true
-    file: config/clustering_validation/scenarios_validation.yaml
+    file: config/clustering_validation/scenarios_validation_400_convergence.yaml
   disable_progressbar: false
   shared_resources:
     policy: false
@@ -1120,7 +1120,7 @@ clustering:
       fixed_nodes: 30
       fixed_days: 20
 
-      lambda_ts: 0.05
+      lambda_ts: 0.10
       normalize: "zscore"
       max_total_steps: 900
       init_mode: "balanced"       # "balanced" or "full" balanced -> nearly sqrt total; full from total

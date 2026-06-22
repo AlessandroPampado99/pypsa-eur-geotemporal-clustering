@@ -42,6 +42,8 @@ from scripts.geo_temporal_clustering.core import (
     electric_demand_weights_by_bus,
     cf_by_bus_timeseries,
     reconstruct_tensor_from_medoids,
+    reconstruct_tensor_from_medoids_temporal_mean,
+    weighted_reconstruction_loss,
     zscore_global,
     minmax_global,
 )
@@ -53,7 +55,12 @@ from scripts.geo_temporal_clustering.core import (
 
 NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/reference_nuts3/complete/networks/base_s_adm_elec_.nc")
 
-OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean")
+OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean_0.15_fixedpair")
+
+# Standalone reducer mode:
+# - "budget": reproduce the budget/local-search behaviour
+# - "fixed_pair": evaluate exactly each (K_nodes, K_days) pair
+RUN_MODE = "fixed_pair"
 
 # Main scan parameters
 TARGET_BUDGET = 400
@@ -72,7 +79,7 @@ MIN_INIT_DAYS = 1
 MAX_INIT_DAYS = None  # None means use all available days
 
 # Include a run starting from full resolution
-RUN_FULL_BASELINE = True
+RUN_FULL_BASELINE = False
 
 # Seeds to test for each initial pair
 RANDOM_STATES = [0]
@@ -109,7 +116,7 @@ NODE_WEIGHTS_MODE = "electric_demand"
 
 # Reducer parameters
 REDUCER_BASE_CFG = {
-    "lambda_ts": 0.10,
+    "lambda_ts": 0.15,
     "normalize": "zscore",
     "max_total_steps": TARGET_BUDGET,
     "loss_norm": "l2_squared",
@@ -148,6 +155,19 @@ def validate_settings() -> None:
         raise ValueError(
             f"REPRESENTATION must be one of {sorted(valid_representations)}, "
             f"got {REPRESENTATION!r}."
+        )
+
+    valid_run_modes = {"budget", "fixed_pair"}
+    if RUN_MODE not in valid_run_modes:
+        raise ValueError(
+            f"RUN_MODE must be one of {sorted(valid_run_modes)}, "
+            f"got {RUN_MODE!r}."
+        )
+
+    if RUN_MODE == "fixed_pair" and RUN_FULL_BASELINE:
+        raise ValueError(
+            "RUN_FULL_BASELINE must be False when RUN_MODE='fixed_pair', "
+            "because the full baseline has no init_nodes/init_days pair."
         )
 
     valid_node_weight_modes = {None, "none", "mean_load", "peak_load", "electric_demand"}
@@ -195,6 +215,184 @@ def build_feature_weights(feature_names: List[str], cfg_weights: Dict[str, float
 
     return weights
 
+    return float(np.sum(wn * err_by_node))
+
+def compute_space_time_loss_decomposition(
+    *,
+    X: np.ndarray,
+    feature_weights: np.ndarray,
+    node_weights: Optional[np.ndarray],
+    labels_nodes: np.ndarray,
+    labels_days: np.ndarray,
+    rep_nodes: np.ndarray,
+    normalize: str,
+    loss_norm: str,
+) -> dict:
+    """
+    Decompose the reconstruction loss consistently with the reducer objective:
+    spatial medoids + temporal cluster means.
+    """
+    X = np.asarray(X, dtype=float)
+    N, D, F = X.shape
+
+    if normalize == "zscore":
+        Xn = zscore_global(X)
+    elif normalize == "minmax":
+        Xn = minmax_global(X)
+    else:
+        raise ValueError("normalize must be either 'zscore' or 'minmax'.")
+
+    labels_nodes = np.asarray(labels_nodes, dtype=int)
+    labels_days = np.asarray(labels_days, dtype=int)
+    rep_nodes = np.asarray(rep_nodes, dtype=int)
+
+    # Full reconstruction: same logic as the reducer objective.
+    X_rec_full = reconstruct_tensor_from_medoids_temporal_mean(
+        Xn,
+        rep_nodes=rep_nodes,
+        labels_nodes=labels_nodes,
+        labels_days=labels_days,
+    )
+
+    # Spatial-only reconstruction:
+    # use spatial medoids, but keep all original days unchanged.
+    node_src = rep_nodes[labels_nodes]
+    X_rec_space = Xn[node_src, :, :]
+
+    # Temporal-only reconstruction:
+    # keep original nodes, but replace each day by the mean of its temporal cluster.
+    X_rec_time = np.empty_like(Xn)
+
+    for c_day in np.unique(labels_days):
+        day_idx = np.where(labels_days == c_day)[0]
+        cluster_mean = Xn[:, day_idx, :].mean(axis=1)
+        X_rec_time[:, day_idx, :] = cluster_mean[:, None, :]
+
+    loss_full = weighted_reconstruction_loss(
+        Xn,
+        X_rec_full,
+        feature_weights=feature_weights,
+        node_loss_weights=node_weights,
+        loss_norm=loss_norm,
+    )
+
+    loss_space = weighted_reconstruction_loss(
+        Xn,
+        X_rec_space,
+        feature_weights=feature_weights,
+        node_loss_weights=node_weights,
+        loss_norm=loss_norm,
+    )
+
+    loss_time = weighted_reconstruction_loss(
+        Xn,
+        X_rec_time,
+        feature_weights=feature_weights,
+        node_loss_weights=node_weights,
+        loss_norm=loss_norm,
+    )
+
+    return {
+        "loss_full": float(loss_full),
+        "loss_space_only": float(loss_space),
+        "loss_time_only": float(loss_time),
+        "loss_interaction": float(loss_full - loss_space - loss_time),
+        "space_share_vs_full": float(loss_space / (loss_full + 1e-12)),
+        "time_share_vs_full": float(loss_time / (loss_full + 1e-12)),
+        "space_to_time_ratio": float(loss_space / (loss_time + 1e-12)),
+    }
+
+def compute_axis_loss_breakdown(
+    *,
+    X: np.ndarray,
+    feature_names: List[str],
+    feature_weights: np.ndarray,
+    node_weights: Optional[np.ndarray],
+    labels_nodes: np.ndarray,
+    labels_days: np.ndarray,
+    rep_nodes: np.ndarray,
+    rep_days: np.ndarray,
+    normalize: str,
+    loss_norm: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute reconstruction loss by original node and by original day.
+
+    This is consistent with spatial medoids + temporal cluster means.
+    rep_days is kept only for traceability in the output.
+    """
+    X = np.asarray(X, dtype=float)
+    N, D, F = X.shape
+
+    if normalize == "zscore":
+        Xn = zscore_global(X)
+    elif normalize == "minmax":
+        Xn = minmax_global(X)
+    else:
+        raise ValueError("normalize must be either 'zscore' or 'minmax'.")
+
+    X_rec = reconstruct_tensor_from_medoids_temporal_mean(
+        Xn,
+        rep_nodes=np.asarray(rep_nodes, dtype=int),
+        labels_nodes=np.asarray(labels_nodes, dtype=int),
+        labels_days=np.asarray(labels_days, dtype=int),
+    )
+
+    if loss_norm == "l2_squared":
+        err = (Xn - X_rec) ** 2
+    elif loss_norm == "l1":
+        err = np.abs(Xn - X_rec)
+    else:
+        raise ValueError("loss_norm must be either 'l1' or 'l2_squared'.")
+
+    wf = np.asarray(feature_weights, dtype=float)
+    if wf.shape != (F,):
+        raise ValueError(f"feature_weights must have shape ({F},), got {wf.shape}.")
+    wf = wf / (wf.mean() + 1e-12)
+
+    if node_weights is None:
+        wn = np.ones(N, dtype=float)
+    else:
+        wn = np.asarray(node_weights, dtype=float)
+        if wn.shape != (N,):
+            raise ValueError(f"node_weights must have shape ({N},), got {wn.shape}.")
+        wn = wn / (wn.mean() + 1e-12)
+
+    err_weighted = err * wf[None, None, :]
+
+    node_loss = err_weighted.sum(axis=(1, 2)) * wn
+    day_loss = (err_weighted * wn[:, None, None]).sum(axis=(0, 2))
+
+    total = float(node_loss.sum())
+
+    labels_nodes = np.asarray(labels_nodes, dtype=int)
+    labels_days = np.asarray(labels_days, dtype=int)
+    rep_nodes = np.asarray(rep_nodes, dtype=int)
+    rep_days = np.asarray(rep_days, dtype=int)
+
+    df_node = pd.DataFrame(
+        {
+            "node_index": np.arange(N, dtype=int),
+            "node_cluster": labels_nodes,
+            "rep_node_index": rep_nodes[labels_nodes],
+            "node_weight_normalized": wn,
+            "loss": node_loss,
+            "loss_share": node_loss / (total + 1e-12),
+        }
+    ).sort_values("loss", ascending=False)
+
+    df_day = pd.DataFrame(
+        {
+            "day_index": np.arange(D, dtype=int),
+            "day_cluster": labels_days,
+            "rep_day_index": rep_days[labels_days],
+            "loss": day_loss,
+            "loss_share": day_loss / (total + 1e-12),
+        }
+    ).sort_values("loss", ascending=False)
+
+    return df_node.reset_index(drop=True), df_day.reset_index(drop=True)
+
 def compute_feature_loss_breakdown(
     *,
     X: np.ndarray,
@@ -228,11 +426,10 @@ def compute_feature_loss_breakdown(
     else:
         raise ValueError("normalize must be either 'zscore' or 'minmax'.")
 
-    X_rec = reconstruct_tensor_from_medoids(
+    X_rec = reconstruct_tensor_from_medoids_temporal_mean(
         Xn,
         rep_nodes=np.asarray(rep_nodes, dtype=int),
         labels_nodes=np.asarray(labels_nodes, dtype=int),
-        rep_days=np.asarray(rep_days, dtype=int),
         labels_days=np.asarray(labels_days, dtype=int),
     )
 
@@ -739,34 +936,68 @@ def run_one_reducer(
     init_nodes: Optional[int],
     init_days: Optional[int],
     random_state: int,
-) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Run one reducer instance and return summary, history, and evaluations.
     """
-    reducer = AlternatingSpatioTemporalReducer(
-        lambda_ts=float(REDUCER_BASE_CFG["lambda_ts"]),
-        normalize=str(REDUCER_BASE_CFG["normalize"]),
-        max_total_steps=int(REDUCER_BASE_CFG["max_total_steps"]),
-        loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
-        init_mode=str(init_mode),
-        init_nodes=init_nodes,
-        init_days=init_days,
-        beta=float(REDUCER_BASE_CFG["beta"]),
-        beta_growth=float(REDUCER_BASE_CFG["beta_growth"]),
-        beta_max=float(REDUCER_BASE_CFG["beta_max"]),
-        max_iter=int(REDUCER_BASE_CFG["max_iter"]),
-        tol_no_change=int(REDUCER_BASE_CFG["tol_no_change"]),
-        objective_tol_rel=float(REDUCER_BASE_CFG["objective_tol_rel"]),
-        verbose=bool(REDUCER_BASE_CFG["verbose"]),
-        norm_q=float(REDUCER_BASE_CFG["norm_q"]),
-        use_pca_days=bool(REDUCER_BASE_CFG["use_pca_days"]),
-        pca_days_n_components=REDUCER_BASE_CFG["pca_days_n_components"],
-        pca_days_random_state=int(REDUCER_BASE_CFG["pca_days_random_state"]),
-        standardize_day_matrix_cols=bool(REDUCER_BASE_CFG["standardize_day_matrix_cols"]),
-        kmedoids_max_iter=int(REDUCER_BASE_CFG["kmedoids_max_iter"]),
-        random_state=int(random_state),
-        feature_weights=feature_weights,
-    )
+    if RUN_MODE == "fixed_pair":
+        if init_nodes is None or init_days is None:
+            raise ValueError(
+                "RUN_MODE='fixed_pair' requires init_nodes and init_days. "
+                "Set RUN_FULL_BASELINE=False."
+            )
+
+        reducer = AlternatingSpatioTemporalReducer(
+            lambda_ts=float(REDUCER_BASE_CFG["lambda_ts"]),
+            normalize=str(REDUCER_BASE_CFG["normalize"]),
+
+            # In fixed-pair mode this is not used to search, but keep it coherent.
+            max_total_steps=int(init_nodes * init_days),
+
+            reduction_mode="fixed_pair",
+            fixed_nodes=int(init_nodes),
+            fixed_days=int(init_days),
+
+            loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
+            verbose=bool(REDUCER_BASE_CFG["verbose"]),
+            norm_q=float(REDUCER_BASE_CFG["norm_q"]),
+            use_pca_days=bool(REDUCER_BASE_CFG["use_pca_days"]),
+            pca_days_n_components=REDUCER_BASE_CFG["pca_days_n_components"],
+            pca_days_random_state=int(REDUCER_BASE_CFG["pca_days_random_state"]),
+            standardize_day_matrix_cols=bool(REDUCER_BASE_CFG["standardize_day_matrix_cols"]),
+            kmedoids_max_iter=int(REDUCER_BASE_CFG["kmedoids_max_iter"]),
+            random_state=int(random_state),
+            feature_weights=feature_weights,
+        )
+
+    elif RUN_MODE == "budget":
+        reducer = AlternatingSpatioTemporalReducer(
+            lambda_ts=float(REDUCER_BASE_CFG["lambda_ts"]),
+            normalize=str(REDUCER_BASE_CFG["normalize"]),
+            max_total_steps=int(REDUCER_BASE_CFG["max_total_steps"]),
+            loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
+            init_mode=str(init_mode),
+            init_nodes=init_nodes,
+            init_days=init_days,
+            beta=float(REDUCER_BASE_CFG["beta"]),
+            beta_growth=float(REDUCER_BASE_CFG["beta_growth"]),
+            beta_max=float(REDUCER_BASE_CFG["beta_max"]),
+            max_iter=int(REDUCER_BASE_CFG["max_iter"]),
+            tol_no_change=int(REDUCER_BASE_CFG["tol_no_change"]),
+            objective_tol_rel=float(REDUCER_BASE_CFG["objective_tol_rel"]),
+            verbose=bool(REDUCER_BASE_CFG["verbose"]),
+            norm_q=float(REDUCER_BASE_CFG["norm_q"]),
+            use_pca_days=bool(REDUCER_BASE_CFG["use_pca_days"]),
+            pca_days_n_components=REDUCER_BASE_CFG["pca_days_n_components"],
+            pca_days_random_state=int(REDUCER_BASE_CFG["pca_days_random_state"]),
+            standardize_day_matrix_cols=bool(REDUCER_BASE_CFG["standardize_day_matrix_cols"]),
+            kmedoids_max_iter=int(REDUCER_BASE_CFG["kmedoids_max_iter"]),
+            random_state=int(random_state),
+            feature_weights=feature_weights,
+        )
+
+    else:
+        raise ValueError(f"Unsupported RUN_MODE={RUN_MODE!r}.")
 
     t0 = time.perf_counter()
 
@@ -776,6 +1007,26 @@ def run_one_reducer(
         lon,
         buses=base_buses,
         node_weights=node_weights,
+    )
+
+    axis_decomp = compute_space_time_loss_decomposition(
+        X=X,
+        feature_weights=feature_weights,
+        node_weights=node_weights,
+        labels_nodes=result.labels_nodes,
+        labels_days=result.labels_days,
+        rep_nodes=result.rep_nodes,
+        normalize=str(REDUCER_BASE_CFG["normalize"]),
+        loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
+    )
+
+    axis_decomp["loss_full_objective_abs_diff"] = abs(
+        float(axis_decomp["loss_full"]) - float(result.objective)
+    )
+
+    axis_decomp["loss_full_objective_rel_diff"] = (
+        axis_decomp["loss_full_objective_abs_diff"]
+        / max(abs(float(result.objective)), 1e-12)
     )
 
     feature_losses = compute_feature_loss_breakdown(
@@ -790,6 +1041,22 @@ def run_one_reducer(
         normalize=str(REDUCER_BASE_CFG["normalize"]),
         loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
     )
+
+    node_losses, day_losses = compute_axis_loss_breakdown(
+        X=X,
+        feature_names=feature_names,
+        feature_weights=feature_weights,
+        node_weights=node_weights,
+        labels_nodes=result.labels_nodes,
+        labels_days=result.labels_days,
+        rep_nodes=result.rep_nodes,
+        rep_days=result.rep_days,
+        normalize=str(REDUCER_BASE_CFG["normalize"]),
+        loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
+    )
+
+    node_losses.insert(0, "run_id", run_id)
+    day_losses.insert(0, "run_id", run_id)
 
     feature_losses.insert(0, "run_id", run_id)
     feature_losses.insert(1, "init_mode", init_mode)
@@ -806,6 +1073,7 @@ def run_one_reducer(
 
     summary = {
         "run_id": run_id,
+        "run_mode": RUN_MODE,
         "init_mode": init_mode,
         "init_nodes": init_nodes,
         "init_days": init_days,
@@ -832,6 +1100,8 @@ def run_one_reducer(
         "norm_q": float(REDUCER_BASE_CFG["norm_q"]),
     }
 
+    summary.update(axis_decomp)
+
     history = pd.DataFrame(result.history)
     if not history.empty:
         history.insert(0, "run_id", run_id)
@@ -853,7 +1123,7 @@ def run_one_reducer(
     if not history.empty and not evaluations.empty:
         history = enrich_history_with_evaluation_alternatives(history, evaluations)
 
-    return summary, history, evaluations, feature_losses
+    return summary, history, evaluations, feature_losses, node_losses, day_losses
 
 
 def main() -> None:
@@ -904,6 +1174,7 @@ def main() -> None:
         "max_initial_steps": MAX_INITIAL_STEPS,
         "pair_mode": PAIR_MODE,
         "run_full_baseline": RUN_FULL_BASELINE,
+        "run_mode": RUN_MODE,
         "random_states": RANDOM_STATES,
         "n_nodes": n_nodes,
         "n_days": n_days,
@@ -922,6 +1193,8 @@ def main() -> None:
     histories: List[pd.DataFrame] = []
     evaluations: List[pd.DataFrame] = []
     feature_losses_all: List[pd.DataFrame] = []
+    node_losses_all: List[pd.DataFrame] = []
+    day_losses_all: List[pd.DataFrame] = []
 
     total_runs = len(pairs) * len(RANDOM_STATES)
     if RUN_FULL_BASELINE:
@@ -942,7 +1215,7 @@ def main() -> None:
                 f"init_mode=full, seed={seed}"
             )
 
-            summary, history, evals, feature_losses = run_one_reducer(
+            summary, history, evals, feature_losses, node_losses, day_losses = run_one_reducer(
                 X=X,
                 lat=lat,
                 lon=lon,
@@ -964,9 +1237,23 @@ def main() -> None:
                 evaluations.append(evals)
             if not feature_losses.empty:
                 feature_losses_all.append(feature_losses)
-
+            if not node_losses.empty:
+                node_losses_all.append(node_losses)
+            if not day_losses.empty:
+                day_losses_all.append(day_losses)
             pd.DataFrame(summaries).to_csv(OUT_DIR / "scan_summary.csv", index=False)
 
+            if node_losses_all:
+                pd.concat(node_losses_all, ignore_index=True).to_csv(
+                    OUT_DIR / "scan_node_losses.csv",
+                    index=False,
+                )
+
+            if day_losses_all:
+                pd.concat(day_losses_all, ignore_index=True).to_csv(
+                    OUT_DIR / "scan_day_losses.csv",
+                    index=False,
+                )
             if feature_losses_all:
                 pd.concat(feature_losses_all, ignore_index=True).to_csv(
                     OUT_DIR / "scan_feature_losses.csv",
@@ -980,14 +1267,14 @@ def main() -> None:
         for seed in RANDOM_STATES:
             run_counter += 1
             init_steps = int(init_nodes * init_days)
-            run_id = f"init_n{init_nodes}_d{init_days}_s{init_steps}_seed{seed}"
+            run_id = f"{RUN_MODE}_n{init_nodes}_d{init_days}_s{init_steps}_seed{seed}"
 
             print(
                 f">>> [{run_counter}/{total_runs}] Running {run_id}: "
                 f"init=({init_nodes}, {init_days}), steps={init_steps}, seed={seed}"
             )
 
-            summary, history, evals, feature_losses = run_one_reducer(
+            summary, history, evals, feature_losses, node_losses, day_losses = run_one_reducer(
                 X=X,
                 lat=lat,
                 lon=lon,
@@ -1009,6 +1296,18 @@ def main() -> None:
                 evaluations.append(evals)
             if not feature_losses.empty:
                 feature_losses_all.append(feature_losses)
+            if not node_losses.empty:
+                node_losses_all.append(node_losses)
+            if not day_losses.empty:
+                day_losses_all.append(day_losses)
+
+            if node_losses_all:
+                df_node_losses = pd.concat(node_losses_all, ignore_index=True)
+                df_node_losses.to_csv(OUT_DIR / "scan_node_losses.csv", index=False)
+
+            if day_losses_all:
+                df_day_losses = pd.concat(day_losses_all, ignore_index=True)
+                df_day_losses.to_csv(OUT_DIR / "scan_day_losses.csv", index=False)
 
             # Incremental output, useful if the scan is interrupted.
             pd.DataFrame(summaries).to_csv(OUT_DIR / "scan_summary.csv", index=False)

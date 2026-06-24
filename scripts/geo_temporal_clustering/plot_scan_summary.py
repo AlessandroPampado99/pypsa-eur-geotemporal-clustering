@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 # USER SETTINGS
 # =========================
 
-SCAN_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean_0.15_fixedpair")  # Directory containing the scan_summary.csv and final_shape_summary.csv
+SCAN_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean_0.15_full")  # Directory containing the scan_summary.csv and final_shape_summary.csv
 
 SUMMARY_CSV = SCAN_DIR / "scan_summary.csv"
 FINAL_SHAPE_CSV = SCAN_DIR / "final_shape_summary.csv"

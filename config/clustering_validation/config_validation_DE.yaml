@@ -20,7 +20,7 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "reference_nuts3_mean_400_nolineexpansion_convergence"
+  prefix: "reference_nuts3_DE"
   name: all
   scenarios:
     enable: true
@@ -47,7 +47,7 @@ scenario:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#countries
 countries:
-- IT
+- DE
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#snapshots
 snapshots:
@@ -1126,6 +1126,7 @@ clustering:
       init_mode: "balanced"       # "balanced" or "full" balanced -> nearly sqrt total; full from total
       init_nodes: null # if you want to fix them at the beginning
       init_days: null
+      candidate_seed_mode: "current"  # "current" or "full"
       beta: 0.15 # spatio temporal balance parameter
       beta_growth: 2.0
       beta_max: 0.5
@@ -1179,7 +1180,7 @@ adjustments:
 solving:
   options:
     clip_p_max_pu: 0.01
-    load_shedding: false
+    load_shedding: true
     curtailment_mode: false
     noisy_costs: true
     skip_iterations: true

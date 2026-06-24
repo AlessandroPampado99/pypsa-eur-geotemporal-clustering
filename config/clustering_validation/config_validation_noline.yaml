@@ -20,7 +20,7 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "reference_nuts3_mean_400_nolineexpansion_convergence"
+  prefix: "reference_nuts3_mean_400_nolineexpansion"
   name: all
   scenarios:
     enable: true

@@ -19,7 +19,6 @@ import pandas as pd
 import pypsa
 import geopandas as gpd
 
-from pypsa.clustering.spatial import get_clustering_from_busmap
 
 # Ensure repo root on sys.path (PyPSA-Eur scripts style)
 import sys
@@ -40,6 +39,10 @@ from scripts.geo_temporal_clustering.core import (
     cf_by_bus_timeseries,
     build_full_busmap,
     apply_temporal_reduction,
+)
+
+from scripts.geo_temporal_clustering.spatial_reconstruction import (
+    reconstruct_spatially_clustered_network,
 )
 
 logger = logging.getLogger(__name__)
@@ -301,32 +304,15 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Spatial clustering / reconstruction via PyPSA
     # ---------------------------------------------------------------------
-    if "location" in n.buses.columns:
-        n.buses.loc[:, "location"] = busmap.reindex(n.buses.index).astype(str)
+    logger.info("Reconstructing clustered network using GT spatial reconstruction.")
 
-    logger.info("Reconstructing clustered network using PyPSA get_clustering_from_busmap.")
-    clustering = get_clustering_from_busmap(
-        n,
-        busmap,
-        bus_strategies={},
-        line_strategies={},
-        custom_line_groupers=["build_year"] if "build_year" in n.lines.columns else [],
+    nc, linemap = reconstruct_spatially_clustered_network(
+        n=n,
+        busmap=busmap,
+        aggregate_one_ports=True,
+        aggregate_links=True,
+        custom_line_groupers=[],
     )
-    nc = clustering.n
-
-    # Set clustered bus coordinates to representative bus coordinates
-    if "x" in n.buses.columns and "y" in n.buses.columns:
-        for b_new in nc.buses.index.astype(str):
-            if b_new.endswith(" H2"):
-                base = b_new[:-3]
-            elif b_new.endswith(" battery"):
-                base = b_new[:-8]
-            else:
-                base = b_new
-
-            if base in n.buses.index:
-                nc.buses.at[b_new, "x"] = float(n.buses.at[base, "x"])
-                nc.buses.at[b_new, "y"] = float(n.buses.at[base, "y"])
 
     # ---------------------------------------------------------------------
     # Temporal reduction
@@ -422,7 +408,7 @@ def main() -> None:
 
     # Busmap / Linemap
     busmap.to_csv(out_busmap)
-    clustering.linemap.to_csv(out_linemap)
+    linemap.to_csv(out_linemap)
 
     # Extra history/evaluations CSVs
     if len(result.history) > 0:

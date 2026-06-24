@@ -77,6 +77,7 @@ def reconstruct_spatially_clustered_network(
         n.buses.loc[:, "location"] = busmap.reindex(n.buses.index).astype(str)
 
     kwargs = _build_get_clustering_kwargs(
+        n=n,
         aggregate_one_ports=aggregate_one_ports,
         custom_line_groupers=custom_line_groupers,
     )
@@ -124,38 +125,18 @@ def _clean_busmap(busmap: pd.Series, n: pypsa.Network) -> pd.Series:
 def _sanitize_line_attributes_before_clustering(n: pypsa.Network) -> None:
     """
     Sanitize Line attributes before PyPSA line aggregation.
-
-    PyPSA's default line aggregation requires consensus on some attributes.
-    In practice, some boolean-like attributes may contain NaN although the
-    intended default is False. This makes PyPSA fail with errors such as
-    0.0 vs NaN for the 'dc' attribute.
     """
     if n.lines.empty:
         return
 
-    if "dc" in n.lines.columns:
-        n.lines.loc[:, "dc"] = (
-            n.lines["dc"]
-            .fillna(False)
-            .astype(bool)
-        )
+    for col in ["dc", "under_construction", "s_nom_extendable"]:
+        if col in n.lines.columns:
+            n.lines[col] = n.lines[col].fillna(False).astype(bool)
 
-    if "under_construction" in n.lines.columns:
-        n.lines.loc[:, "under_construction"] = (
-            n.lines["under_construction"]
-            .fillna(False)
-            .astype(bool)
-        )
-
-    if "s_nom_extendable" in n.lines.columns:
-        n.lines.loc[:, "s_nom_extendable"] = (
-            n.lines["s_nom_extendable"]
-            .fillna(False)
-            .astype(bool)
-        )
-
+            
 def _build_get_clustering_kwargs(
     *,
+    n: pypsa.Network,
     aggregate_one_ports: bool,
     custom_line_groupers: list[str] | None,
 ) -> dict[str, Any]:
@@ -168,15 +149,12 @@ def _build_get_clustering_kwargs(
     line_groupers = custom_line_groupers or []
 
     kwargs: dict[str, Any] = {
-        "bus_strategies": {},
+        "bus_strategies": _build_bus_strategies(n),
         "line_strategies": {},
         "custom_line_groupers": line_groupers,
     }
 
     if aggregate_one_ports:
-        # PyPSA aggregates one-port components by clustered bus and carrier.
-        # This is the key switch that prevents hundreds of remapped but
-        # non-aggregated generators/stores from surviving the GT reduction.
         kwargs["aggregate_one_ports"] = {
             "Generator",
             "Load",
@@ -184,8 +162,6 @@ def _build_get_clustering_kwargs(
             "StorageUnit",
         }
 
-        # Keep only robust custom strategies. All other attributes are handled
-        # by PyPSA's default one-port aggregation strategies.
         kwargs["generator_strategies"] = {
             "committable": "any",
             "ramp_limit_up": "max",
@@ -196,6 +172,31 @@ def _build_get_clustering_kwargs(
 
     return _filter_supported_kwargs(get_clustering_from_busmap, kwargs)
 
+def _build_bus_strategies(n: pypsa.Network) -> dict[str, Any]:
+    """
+    Build custom Bus aggregation strategies.
+
+    PyPSA's default Bus aggregation uses strict consensus for several
+    attributes. This is too strict when an extra no-load electric bus is assigned
+    to the nearest clustered representative, because boolean-like metadata such
+    as substation_lv may differ inside the cluster.
+
+    For these flags, max/any is the intended logic:
+    if at least one bus in the aggregate is a low-voltage substation, the
+    clustered bus should retain that flag.
+    """
+    candidate_strategies: dict[str, Any] = {
+        "substation_lv": "max",
+        "substation_off": "max",
+        "substation_dc": "max",
+        "substation": "max",
+    }
+
+    return {
+        col: strategy
+        for col, strategy in candidate_strategies.items()
+        if col in n.buses.columns
+    }
 
 def _filter_supported_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     """

@@ -55,12 +55,12 @@ from scripts.geo_temporal_clustering.core import (
 
 NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/reference_nuts3/complete/networks/base_s_adm_elec_.nc")
 
-OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean_0.15_fixedpair")
+OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_realmean_0.15_full")
 
 # Standalone reducer mode:
 # - "budget": reproduce the budget/local-search behaviour
 # - "fixed_pair": evaluate exactly each (K_nodes, K_days) pair
-RUN_MODE = "fixed_pair"
+RUN_MODE = "budget"
 
 # Main scan parameters
 TARGET_BUDGET = 400
@@ -133,6 +133,7 @@ REDUCER_BASE_CFG = {
     "pca_days_random_state": 0,
     "standardize_day_matrix_cols": False,
     "kmedoids_max_iter": 100,
+    "candidate_seed_mode": "full",
 }
 
 # Temporal representation strategy used when the clustered network is actually built.
@@ -870,6 +871,22 @@ def prepare_clustering_inputs(network_path: Path) -> dict:
         stats=STATS,
     )
 
+    np.savez_compressed(
+        OUT_DIR / "pre_clustering_tensor.npz",
+        X=X,
+        feature_names=np.asarray(feature_names, dtype=str),
+        base_buses=np.asarray(base_buses, dtype=str),
+        snapshots=np.asarray(snaps.astype(str), dtype=str),
+        lat=lat,
+        lon=lon,
+        hours_per_day=np.asarray(HOURS_PER_DAY),
+        feature_mode=np.asarray(FEATURE_MODE),
+        stats=np.asarray(STATS, dtype=str),
+        network_path=np.asarray(str(network_path)),
+    )
+
+    print(f">>> Exported pre-clustering tensor to: {OUT_DIR / 'pre_clustering_tensor.npz'}")
+
     feature_weights = build_feature_weights(feature_names, FEATURE_WEIGHTS_CFG)
 
     node_weights = None
@@ -957,7 +974,9 @@ def run_one_reducer(
             reduction_mode="fixed_pair",
             fixed_nodes=int(init_nodes),
             fixed_days=int(init_days),
-
+            candidate_seed_mode=str(
+                REDUCER_BASE_CFG.get("candidate_seed_mode", "current")
+            ),
             loss_norm=str(REDUCER_BASE_CFG["loss_norm"]),
             verbose=bool(REDUCER_BASE_CFG["verbose"]),
             norm_q=float(REDUCER_BASE_CFG["norm_q"]),
@@ -994,6 +1013,9 @@ def run_one_reducer(
             kmedoids_max_iter=int(REDUCER_BASE_CFG["kmedoids_max_iter"]),
             random_state=int(random_state),
             feature_weights=feature_weights,
+                        candidate_seed_mode=str(
+                REDUCER_BASE_CFG.get("candidate_seed_mode", "current")
+            ),
         )
 
     else:

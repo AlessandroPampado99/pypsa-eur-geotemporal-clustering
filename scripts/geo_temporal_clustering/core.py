@@ -1189,6 +1189,7 @@ class AlternatingSpatioTemporalReducer:
         standardize_day_matrix_cols: bool = False,
         kmedoids_max_iter: int = 100,
         random_state: int = 0,
+        candidate_seed_mode: Literal["current", "full"] = "current",
         enforce_spatial_adjacency: bool = False,
         regions_gdf: Optional[gpd.GeoDataFrame] = None,
         region_name_col: str = "name",
@@ -1227,7 +1228,7 @@ class AlternatingSpatioTemporalReducer:
         self.region_name_col = str(region_name_col)
 
         self.feature_weights = feature_weights
-
+        self.candidate_seed_mode = str(candidate_seed_mode)
     def _balanced_pair(self, N: int, D: int, budget: int) -> Tuple[int, int]:
         """Find a near-balanced integer pair (K_nodes, K_days) under the budget."""
         best_pair = (1, 1)
@@ -1603,8 +1604,9 @@ class AlternatingSpatioTemporalReducer:
                     f"fixed_days must be in [1, {D}], got {K_days}."
                 )
 
-            rep_days_seed = np.arange(D, dtype=int)
-            rep_weights_seed = np.ones(D, dtype=int)
+            full_rep_days_seed = np.arange(D, dtype=int)
+            full_rep_weights_seed = np.ones(D, dtype=int)
+
 
             if K_nodes == N and K_days == D:
                 current_solution = dict(
@@ -1628,8 +1630,8 @@ class AlternatingSpatioTemporalReducer:
                 current_solution = self._solve_for_pair(
                     Xn,
                     D_geo_n,
-                    rep_days_seed,
-                    rep_weights_seed,
+                    full_rep_days_seed,
+                    full_rep_weights_seed,
                     K_nodes,
                     K_days,
                     node_loss_weights=node_loss_weights,
@@ -1691,8 +1693,31 @@ class AlternatingSpatioTemporalReducer:
         evaluations: List[dict] = []
         history: List[dict] = []
 
-        rep_days_seed = np.arange(D, dtype=int)
-        rep_weights_seed = np.ones(D, dtype=int)
+        full_rep_days_seed = np.arange(D, dtype=int)
+        full_rep_weights_seed = np.ones(D, dtype=int)
+
+        def get_candidate_seed(current_solution: dict) -> Tuple[np.ndarray, np.ndarray]:
+            """
+            Return the temporal seed used to evaluate candidate pairs.
+
+            - "current": use the representative days of the current solution.
+            - "full": always use the full original temporal resolution.
+            """
+            if self.candidate_seed_mode == "current":
+                return (
+                    current_solution["rep_days"],
+                    current_solution["rep_weights"],
+                )
+
+            if self.candidate_seed_mode == "full":
+                return (
+                    full_rep_days_seed,
+                    full_rep_weights_seed,
+                )
+
+            raise ValueError(
+                f"Unsupported candidate_seed_mode={self.candidate_seed_mode!r}."
+            )
 
         if current_budget == N * D:
             current_solution = dict(
@@ -1716,8 +1741,8 @@ class AlternatingSpatioTemporalReducer:
             current_solution = self._solve_for_pair(
                 Xn,
                 D_geo_n,
-                rep_days_seed,
-                rep_weights_seed,
+                full_rep_days_seed,
+                full_rep_weights_seed,
                 K_nodes,
                 K_days,
                 node_loss_weights=node_loss_weights,
@@ -1777,8 +1802,7 @@ class AlternatingSpatioTemporalReducer:
                 kn_bal, kd_bal = self._balanced_pair(N, D, target_budget)
                 candidate_pairs = [(kn_bal, kd_bal, "force_feasible_balanced")]
 
-            seed_days = current_solution["rep_days"]
-            seed_weights = current_solution["rep_weights"]
+            seed_days, seed_weights = get_candidate_seed(current_solution)
 
             candidate_solutions = []
             for cand_kn, cand_kd, move_type in candidate_pairs:
@@ -1991,8 +2015,7 @@ class AlternatingSpatioTemporalReducer:
 
                 continue
 
-            seed_days = current_solution["rep_days"]
-            seed_weights = current_solution["rep_weights"]
+            seed_days, seed_weights = get_candidate_seed(current_solution)
 
             candidate_solutions = []
 

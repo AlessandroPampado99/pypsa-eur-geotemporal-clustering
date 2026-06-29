@@ -20,11 +20,11 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "reference_nuts3_DE"
+  prefix: "reference_nuts3_ES"
   name: all
   scenarios:
     enable: true
-    file: config/clustering_validation/scenarios_validation_400_DE.yaml
+    file: config/clustering_validation/scenarios_validation_400_ES.yaml
   disable_progressbar: false
   shared_resources:
     policy: false
@@ -47,7 +47,7 @@ scenario:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#countries
 countries:
-- DE
+- ES
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#snapshots
 snapshots:

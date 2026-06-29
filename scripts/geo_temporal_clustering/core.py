@@ -2399,41 +2399,223 @@ def strip_suffix(bus: str) -> Tuple[str, str]:
 
 def build_full_busmap(
     n,
-    base_buses: List[str],
-    labels_nodes: np.ndarray,
-    rep_nodes_idx: np.ndarray,
-) -> pd.Series:
+    base_buses,
+    labels_nodes,
+    rep_nodes,
+    *,
+    auxiliary_suffixes=(" H2", " battery"),
+):
     """
-    Build busmap for ALL buses in n.buses.
+    Build a busmap for all buses in the network.
 
-    Strategy:
-    - Cluster is defined on base_buses (typically AC buses).
-    - Each cluster is represented by the medoid bus name (rep_base).
-    - Auxiliary buses (e.g., '<base> H2', '<base> battery') are mapped to
-      '<rep_base> H2' / '<rep_base> battery' to preserve carrier separation.
+    Base electric buses are mapped according to the clustering result.
+
+    Auxiliary buses, such as "<bus> H2" and "<bus> battery", are mapped to the
+    corresponding auxiliary bus of the clustered representative.
+
+    Electric buses that were not included in base_buses are not allowed to
+    remain self-mapped. They are assigned to the representative of the nearest
+    clustered base bus. This avoids creating extra unclustered nodes in the
+    reconstructed network.
     """
-    base_buses = list(base_buses)
+    import numpy as np
+    import pandas as pd
+
+    base_buses = pd.Index(base_buses).astype(str)
+    all_buses = pd.Index(n.buses.index).astype(str)
+
     labels_nodes = np.asarray(labels_nodes, dtype=int)
-    rep_nodes_idx = np.asarray(rep_nodes_idx, dtype=int)
+    rep_nodes = np.asarray(rep_nodes, dtype=int)
 
-    rep_base_by_cluster: Dict[int, str] = {}
-    for idx in rep_nodes_idx:
-        c = int(labels_nodes[idx])
-        rep_base_by_cluster[c] = base_buses[idx]
+    if len(base_buses) != len(labels_nodes):
+        raise ValueError(
+            "base_buses and labels_nodes must have the same length. "
+            f"Got {len(base_buses)} and {len(labels_nodes)}."
+        )
 
-    base_to_rep: Dict[str, str] = {}
-    for b, c in zip(base_buses, labels_nodes):
-        base_to_rep[b] = rep_base_by_cluster[int(c)]
+    # Map cluster label -> representative bus name.
+    rep_bus_by_cluster = {
+        int(cluster_label): str(base_buses[int(rep_idx)])
+        for cluster_label, rep_idx in enumerate(rep_nodes)
+    }
 
-    mapping = {}
-    for bus in n.buses.index.astype(str):
-        base, suffix = strip_suffix(bus)
-        if base in base_to_rep:
-            mapping[bus] = base_to_rep[base] + suffix
+    # Map each clustered base bus -> representative bus.
+    base_to_rep = pd.Series(
+        {
+            str(bus): rep_bus_by_cluster[int(label)]
+            for bus, label in zip(base_buses, labels_nodes)
+        },
+        dtype=str,
+    )
+
+    # Precompute nearest clustered base representative for extra electric buses.
+    nearest_extra_bus_map = _map_extra_electric_buses_to_nearest_representative(
+        n=n,
+        all_buses=all_buses,
+        base_buses=base_buses,
+        base_to_rep=base_to_rep,
+        auxiliary_suffixes=auxiliary_suffixes,
+    )
+
+    busmap = {}
+
+    for bus in all_buses:
+        bus = str(bus)
+
+        base_bus, suffix = _split_auxiliary_bus_suffix(
+            bus,
+            auxiliary_suffixes=auxiliary_suffixes,
+        )
+
+        if suffix is None:
+            # Electric bus.
+            if bus in base_to_rep.index:
+                busmap[bus] = str(base_to_rep.loc[bus])
+            elif bus in nearest_extra_bus_map:
+                busmap[bus] = str(nearest_extra_bus_map[bus])
+            else:
+                raise ValueError(
+                    "Cannot map electric bus that is not in base_buses and "
+                    f"has no nearest representative: {bus}"
+                )
+
         else:
-            mapping[bus] = bus
+            # Auxiliary bus.
+            if base_bus in base_to_rep.index:
+                mapped_base = str(base_to_rep.loc[base_bus])
+            elif base_bus in nearest_extra_bus_map:
+                mapped_base = str(nearest_extra_bus_map[base_bus])
+            else:
+                raise ValueError(
+                    "Cannot map auxiliary bus because its electric base bus "
+                    "is not clustered and has no nearest representative: "
+                    f"{bus} -> base {base_bus}"
+                )
 
-    return pd.Series(mapping, name="busmap").reindex(n.buses.index.astype(str))
+            busmap[bus] = mapped_base + suffix
+
+    busmap = pd.Series(busmap, name="busmap").reindex(all_buses).astype(str)
+
+    self_mapped_non_base = [
+        bus
+        for bus in all_buses
+        if bus == busmap.loc[bus]
+        and bus not in base_buses
+        and not any(bus.endswith(suffix) for suffix in auxiliary_suffixes)
+    ]
+
+    if self_mapped_non_base:
+        raise ValueError(
+            "Some non-base electric buses are still self-mapped after full "
+            "busmap construction. This would create extra clustered nodes. "
+            f"Examples: {self_mapped_non_base[:10]}"
+        )
+
+    return busmap
+
+
+def _split_auxiliary_bus_suffix(bus, *, auxiliary_suffixes=(" H2", " battery")):
+    """
+    Split an auxiliary bus name into electric base bus and suffix.
+
+    Returns
+    -------
+    base_bus, suffix
+        If bus is auxiliary, suffix is one of auxiliary_suffixes.
+        If bus is electric, suffix is None.
+    """
+    bus = str(bus)
+
+    for suffix in auxiliary_suffixes:
+        if bus.endswith(suffix):
+            return bus[: -len(suffix)], suffix
+
+    return bus, None
+
+
+def _map_extra_electric_buses_to_nearest_representative(
+    *,
+    n,
+    all_buses,
+    base_buses,
+    base_to_rep,
+    auxiliary_suffixes=(" H2", " battery"),
+):
+    """
+    Map electric buses outside base_buses to the nearest clustered representative.
+
+    These buses usually exist because the clustering base set was selected from
+    load buses, while the network may contain additional electric buses without
+    load but with lines, links, generators or auxiliary buses.
+    """
+    import numpy as np
+    import pandas as pd
+
+    electric_buses = pd.Index(
+        [
+            bus
+            for bus in all_buses
+            if not any(str(bus).endswith(suffix) for suffix in auxiliary_suffixes)
+        ]
+    ).astype(str)
+
+    extra_buses = electric_buses.difference(base_buses)
+
+    if len(extra_buses) == 0:
+        return {}
+
+    required_cols = {"x", "y"}
+
+    if not required_cols.issubset(n.buses.columns):
+        raise ValueError(
+            "Cannot assign extra electric buses to nearest representatives "
+            "because n.buses does not contain x/y coordinates."
+        )
+
+    base_xy = (
+        n.buses.reindex(base_buses)[["x", "y"]]
+        .astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+    )
+
+    if base_xy.isna().any().any():
+        bad = base_xy.index[base_xy.isna().any(axis=1)].tolist()
+        raise ValueError(
+            "Cannot assign extra electric buses because some clustered base "
+            f"buses have missing coordinates. Examples: {bad[:10]}"
+        )
+
+    extra_xy = (
+        n.buses.reindex(extra_buses)[["x", "y"]]
+        .astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+    )
+
+    if extra_xy.isna().any().any():
+        bad = extra_xy.index[extra_xy.isna().any(axis=1)].tolist()
+        raise ValueError(
+            "Cannot assign extra electric buses because some extra buses have "
+            f"missing coordinates. Examples: {bad[:10]}"
+        )
+
+    base_arr = base_xy.to_numpy(dtype=float)
+    extra_arr = extra_xy.to_numpy(dtype=float)
+
+    # Euclidean distance in lon/lat space is sufficient here because this is
+    # only a fallback for a small number of no-load buses.
+    diff = extra_arr[:, None, :] - base_arr[None, :, :]
+    dist2 = np.sum(diff * diff, axis=2)
+    nearest_pos = np.argmin(dist2, axis=1)
+
+    nearest_base = pd.Series(
+        base_buses.to_numpy()[nearest_pos],
+        index=extra_buses,
+        dtype=str,
+    )
+
+    nearest_rep = nearest_base.map(base_to_rep).astype(str)
+
+    return nearest_rep.to_dict()
 
 
 def _aggregate_temporal_dataframe_by_representative_days(

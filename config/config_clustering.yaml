@@ -1103,7 +1103,14 @@ clustering:
         wind_cf:
           carrier: "onwind"
           weight_by: "p_nom"
+    objective:
+      reconstruction:
+        spatial: "medoid"
+        temporal: "mean"
     reducer:
+      algorithms:
+        spatial: "kmedoids"   # "kmedoids" or "kmeans"
+        temporal: "kmedoids"  # "kmedoids" or "kmeans"
       # Spatial distance = lambda_ts * temporal_distance + (1-lambda_ts) * geo_distance
       lambda_ts: 0.5
       normalize: "zscore"  # "zscore" or "minmax" applied globally over nodes and days.

@@ -1,0 +1,130 @@
+# Example: explicit geo-temporal clustering algorithm configuration.
+#
+# Copy the `clustering.geotemporal` block into your run config and adjust the
+# values marked below. These keys make three decisions explicit:
+#
+# 1. reducer.algorithms
+#    Selects the clustering algorithm used to assign spatial nodes and temporal
+#    days. Supported values are "kmedoids" and "kmeans".
+#
+# 2. objective.reconstruction
+#    Selects how the reducer reconstructs the X[node, day, feature] tensor when
+#    calculating the objective/loss. Supported values are:
+#      - "medoid": use the representative node/day.
+#      - "mean": use the cluster mean.
+#      - "clustering": derive from the corresponding clustering algorithm
+#        (kmedoids -> medoid, kmeans -> mean).
+#      - "reconstruction": match the network reconstruction setting where
+#        available. For temporal reconstruction this follows temporal.representation.
+#
+# 3. temporal.representation
+#    Selects how time-dependent PyPSA network data are represented after
+#    temporal reduction. Supported values are "medoid", "mean", and
+#    "medoid_scaled". This affects the network that is optimized, not only the
+#    reducer objective.
+#
+# Backward-compatible default behavior is:
+#   spatial clustering: kmedoids
+#   temporal clustering: kmedoids
+#   objective spatial reconstruction: medoid
+#   objective temporal reconstruction: mean
+#   network temporal representation: whatever `temporal.representation` is set to
+#
+# Note: even when spatial k-means is used, PyPSA still needs real bus names for
+# the busmap. The implementation therefore assigns each k-means spatial cluster
+# the real bus nearest to the cluster centroid as its representative.
+
+clustering:
+  geotemporal:
+    temporal:
+      # Actual temporal reconstruction used in the clustered PyPSA network.
+      # "mean" makes each representative day contain the hourly cluster mean.
+      # "medoid" keeps the selected representative day unchanged.
+      # "medoid_scaled" keeps medoid shape but scales totals to the cluster total.
+      representation: "mean"
+
+    objective:
+      feature_weights:
+        load: 2.0
+        pv_cf: 1.0
+        wind_cf: 1.0
+      node_weights: "mean_load"
+
+      reconstruction:
+        # Objective/loss reconstruction for the feature tensor.
+        # To evaluate exactly the algorithms chosen below, use "clustering" for
+        # both spatial and temporal. To reproduce the previous behavior, use
+        # spatial="medoid" and temporal="mean".
+        spatial: "medoid"
+        temporal: "mean"
+
+    reducer:
+      reduction_mode: "fixed_pair"  # "fixed_pair" or "budget"
+      fixed_nodes: 30
+      fixed_days: 20
+      max_total_steps: 900
+
+      algorithms:
+        # Algorithm used to assign original buses to spatial clusters.
+        spatial: "kmedoids"   # "kmedoids" or "kmeans"
+        # Algorithm used to assign original days to temporal clusters.
+        temporal: "kmedoids"  # "kmedoids" or "kmeans"
+
+      # Spatial balance between time-series similarity and geography.
+      # For kmedoids this mixes normalized distance matrices.
+      # For kmeans this mixes normalized feature blocks.
+      lambda_ts: 0.05
+      normalize: "zscore"
+      norm_q: 0.95
+
+      # Search/convergence settings.
+      init_mode: "balanced"
+      beta: 0.15
+      beta_growth: 2.0
+      beta_max: 0.5
+      max_iter: 50
+      tol_no_change: 5
+      objective_tol_rel: 1e-5
+      random_state: 0
+      kmedoids_max_iter: 100
+
+      # Not implemented by the current k-medoids/k-means reducer.
+      enforce_spatial_adjacency: false
+      region_name_col: "name"
+
+      pca_days:
+        enable: false
+        n_components: 0.95
+        random_state: 0
+        standardize_day_matrix_cols: false
+
+# Alternative examples:
+#
+# A. Use k-means for both assignments and evaluate objective with cluster means:
+#
+# clustering:
+#   geotemporal:
+#     objective:
+#       reconstruction:
+#         spatial: "clustering"
+#         temporal: "clustering"
+#     reducer:
+#       algorithms:
+#         spatial: "kmeans"
+#         temporal: "kmeans"
+#
+# B. Use k-means for assignments but evaluate the objective using the same
+#    representation as the optimized network:
+#
+# clustering:
+#   geotemporal:
+#     temporal:
+#       representation: "mean"
+#     objective:
+#       reconstruction:
+#         spatial: "clustering"
+#         temporal: "reconstruction"
+#     reducer:
+#       algorithms:
+#         spatial: "kmeans"
+#         temporal: "kmeans"

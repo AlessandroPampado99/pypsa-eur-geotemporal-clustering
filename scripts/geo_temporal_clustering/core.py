@@ -16,6 +16,7 @@ import geopandas as gpd
 
 from sklearn.metrics import pairwise_distances
 from sklearn.decomposition import PCA
+from sklearn.cluster import AgglomerativeClustering, KMeans
 
 
 # =============================================================================
@@ -602,7 +603,8 @@ def build_day_matrix(
     return Y
 
 
-def build_day_distance(
+
+def build_day_feature_matrix(
     X_agg: np.ndarray,
     *,
     cluster_sizes: Optional[np.ndarray] = None,
@@ -612,15 +614,13 @@ def build_day_distance(
     standardize_day_matrix_cols: bool = False,
 ) -> Tuple[np.ndarray, dict]:
     """
-    Compute day-to-day distances on system-state vectors, with optional PCA.
+    Build day feature rows for k-means, optionally after PCA.
     """
     Y = build_day_matrix(
         X_agg,
         cluster_sizes=cluster_sizes,
         standardize_cols=standardize_day_matrix_cols,
     )
-
-    info: dict = {}
 
     if use_pca:
         if isinstance(pca_n_components, float):
@@ -641,19 +641,37 @@ def build_day_distance(
             )
 
         Z = pca.fit_transform(Y)
-        D_day_raw = pairwise_distances(Z, metric="euclidean")
-
         evr = pca.explained_variance_ratio_
         info = dict(
             use_pca=True,
             pca_n_components_selected=int(getattr(pca, "n_components_", Z.shape[1])),
             pca_explained_variance_ratio_sum=float(np.sum(evr)),
         )
-    else:
-        D_day_raw = pairwise_distances(Y, metric="euclidean")
-        info = dict(use_pca=False)
+        return Z, info
 
-    return D_day_raw, info
+    return Y, dict(use_pca=False)
+
+def build_day_distance(
+    X_agg: np.ndarray,
+    *,
+    cluster_sizes: Optional[np.ndarray] = None,
+    use_pca: bool = False,
+    pca_n_components: Union[int, float] = 0.95,
+    pca_random_state: int = 0,
+    standardize_day_matrix_cols: bool = False,
+) -> Tuple[np.ndarray, dict]:
+    """
+    Compute day-to-day distances on system-state vectors, with optional PCA.
+    """
+    Z, info = build_day_feature_matrix(
+        X_agg,
+        cluster_sizes=cluster_sizes,
+        use_pca=use_pca,
+        pca_n_components=pca_n_components,
+        pca_random_state=pca_random_state,
+        standardize_day_matrix_cols=standardize_day_matrix_cols,
+    )
+    return pairwise_distances(Z, metric="euclidean"), info
 
 
 # =============================================================================
@@ -901,6 +919,213 @@ def kmedoids_precomputed(
 
     return labels.astype(int), medoids.astype(int)
 
+
+
+def _check_cluster_count(k: int, n_items: int, *, name: str) -> None:
+    """Validate a requested cluster count."""
+    if k < 1 or k > n_items:
+        raise ValueError(f"{name} must be in [1, {n_items}], got {k}.")
+
+
+def _representatives_nearest_centroid(
+    Z: np.ndarray,
+    labels: np.ndarray,
+    centers: np.ndarray,
+) -> np.ndarray:
+    """Pick one real item per k-means cluster: nearest point to centroid."""
+    labels = np.asarray(labels, dtype=int)
+    reps = np.zeros(centers.shape[0], dtype=int)
+
+    for cl in range(centers.shape[0]):
+        idx = np.where(labels == cl)[0]
+        if len(idx) == 0:
+            raise RuntimeError(f"k-means produced an empty cluster {cl}.")
+        dist2 = np.sum((Z[idx] - centers[cl][None, :]) ** 2, axis=1)
+        reps[cl] = int(idx[int(np.argmin(dist2))])
+
+    return reps
+
+
+def _reorder_clusters_by_representative(
+    labels: np.ndarray,
+    representatives: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Order cluster labels by representative index for deterministic outputs."""
+    labels = np.asarray(labels, dtype=int)
+    representatives = np.asarray(representatives, dtype=int)
+
+    order = np.argsort(representatives)
+    remap = np.empty_like(order)
+    remap[order] = np.arange(len(order), dtype=int)
+
+    return remap[labels].astype(int), representatives[order].astype(int)
+
+
+def kmeans_features(
+    Z: np.ndarray,
+    k: int,
+    *,
+    random_state: int = 0,
+    n_init: Union[int, str] = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Cluster feature rows with k-means and return real-item representatives.
+
+    K-means centroids are not PyPSA buses or real days, so representatives are
+    chosen as the item nearest to each centroid. Those representatives are used
+    for busmap construction, CSV outputs, and medoid-style reconstruction when
+    requested.
+    """
+    Z = np.asarray(Z, dtype=float)
+    if Z.ndim != 2:
+        raise ValueError("k-means input must be a 2D feature matrix.")
+
+    n_items = Z.shape[0]
+    _check_cluster_count(k, n_items, name="k")
+
+    if k == n_items:
+        labels = np.arange(n_items, dtype=int)
+        reps = np.arange(n_items, dtype=int)
+        return labels, reps
+
+    model = KMeans(
+        n_clusters=int(k),
+        random_state=int(random_state),
+        n_init=n_init,
+    )
+    labels_raw = model.fit_predict(Z).astype(int)
+    reps_raw = _representatives_nearest_centroid(Z, labels_raw, model.cluster_centers_)
+
+    return _reorder_clusters_by_representative(labels_raw, reps_raw)
+
+
+def cluster_items(
+    *,
+    algorithm: Literal["kmedoids", "kmeans"],
+    k: int,
+    distance_matrix: Optional[np.ndarray] = None,
+    feature_matrix: Optional[np.ndarray] = None,
+    kmedoids_max_iter: int = 100,
+    random_state: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Cluster items using either k-medoids on distances or k-means on features.
+    """
+    algorithm = str(algorithm).lower()
+
+    if algorithm == "kmedoids":
+        if distance_matrix is None:
+            raise ValueError("distance_matrix is required for kmedoids clustering.")
+        return kmedoids_precomputed(
+            distance_matrix,
+            int(k),
+            max_iter=int(kmedoids_max_iter),
+            random_state=int(random_state),
+        )
+
+    if algorithm == "kmeans":
+        if feature_matrix is None:
+            raise ValueError("feature_matrix is required for kmeans clustering.")
+        return kmeans_features(
+            feature_matrix,
+            int(k),
+            random_state=int(random_state),
+        )
+
+    raise ValueError("algorithm must be one of: 'kmedoids', 'kmeans'.")
+
+
+def build_node_ts_feature_matrix(X: np.ndarray, day_weights: np.ndarray) -> np.ndarray:
+    """
+    Weighted node feature matrix matching build_node_ts_distance inputs.
+    """
+    X = np.asarray(X, dtype=float)
+    N, Dsub, F = X.shape
+
+    w = np.asarray(day_weights, dtype=float)
+    if w.shape != (Dsub,):
+        raise ValueError(f"day_weights must have shape ({Dsub},), got {w.shape}.")
+    if np.any(w < 0):
+        raise ValueError("day_weights must be non-negative.")
+    w = w / (w.sum() + 1e-12)
+
+    return (X * np.sqrt(w)[None, :, None]).reshape(N, Dsub * F)
+
+
+def normalize_feature_columns(Z: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """Column-wise z-score normalization for clustering feature matrices."""
+    Z = np.asarray(Z, dtype=float)
+    mu = Z.mean(axis=0, keepdims=True)
+    sd = Z.std(axis=0, keepdims=True)
+    return (Z - mu) / (sd + eps)
+
+
+def representative_method_from_algorithm(algorithm: str) -> str:
+    """Map a clustering algorithm to the closest reconstruction method."""
+    algorithm = str(algorithm).lower()
+    if algorithm == "kmedoids":
+        return "medoid"
+    if algorithm == "kmeans":
+        return "mean"
+    raise ValueError("algorithm must be one of: 'kmedoids', 'kmeans'.")
+
+
+def reconstruct_tensor(
+    X: np.ndarray,
+    *,
+    rep_nodes: np.ndarray,
+    labels_nodes: np.ndarray,
+    rep_days: np.ndarray,
+    labels_days: np.ndarray,
+    spatial_method: Literal["medoid", "mean"] = "medoid",
+    temporal_method: Literal["medoid", "mean"] = "mean",
+) -> np.ndarray:
+    """
+    Reconstruct X[N,D,F] with explicit spatial and temporal methods.
+
+    spatial_method:
+    - "medoid": use the representative node selected for each node cluster.
+    - "mean": use the mean profile of all nodes in each node cluster.
+
+    temporal_method:
+    - "medoid": use the representative day selected for each day cluster.
+    - "mean": use the mean over all days in each day cluster.
+    """
+    X = np.asarray(X, dtype=float)
+    rep_nodes = np.asarray(rep_nodes, dtype=int)
+    labels_nodes = np.asarray(labels_nodes, dtype=int)
+    rep_days = np.asarray(rep_days, dtype=int)
+    labels_days = np.asarray(labels_days, dtype=int)
+
+    N, D, F = X.shape
+    if labels_nodes.shape != (N,):
+        raise ValueError("labels_nodes must have shape (N,).")
+    if labels_days.shape != (D,):
+        raise ValueError("labels_days must have shape (D,).")
+
+    if spatial_method == "medoid":
+        node_src = rep_nodes[labels_nodes]
+        X_space = X[node_src, :, :]
+    elif spatial_method == "mean":
+        X_space = np.empty_like(X)
+        for cl in np.unique(labels_nodes):
+            idx = np.where(labels_nodes == cl)[0]
+            X_space[idx, :, :] = X[idx, :, :].mean(axis=0, keepdims=True)
+    else:
+        raise ValueError("spatial_method must be one of: 'medoid', 'mean'.")
+
+    if temporal_method == "medoid":
+        day_src = rep_days[labels_days]
+        return X_space[:, day_src, :]
+
+    if temporal_method == "mean":
+        X_rec = np.empty_like(X)
+        for cl in np.unique(labels_days):
+            day_idx = np.where(labels_days == cl)[0]
+            X_rec[:, day_idx, :] = X_space[:, day_idx, :].mean(axis=1, keepdims=True)
+        return X_rec
+
+    raise ValueError("temporal_method must be one of: 'medoid', 'mean'.")
 
 def reconstruct_tensor_from_medoids(
     X: np.ndarray,
@@ -1150,9 +1375,11 @@ class AlternatingSpatioTemporalReducer:
     Main ideas
     ----------
     - The total geo-temporal budget is controlled through max_total_steps.
-    - lambda_ts remains an external hyperparameter and only affects the
-      spatial distance matrix.
-    - Spatial and temporal clustering use k-medoids on precomputed distances.
+    - lambda_ts controls the spatial balance between time-series features and
+      geographic coordinates/distances.
+    - Spatial and temporal clustering can use either k-medoids or k-means.
+    - Objective evaluation uses explicit spatial/temporal reconstruction
+      methods, independently from the clustering algorithms.
     - The accepted solution at each iteration is the one with the lowest
       reconstruction loss among the tested candidates.
     - Two initialization modes are supported:
@@ -1188,6 +1415,10 @@ class AlternatingSpatioTemporalReducer:
         pca_days_random_state: int = 0,
         standardize_day_matrix_cols: bool = False,
         kmedoids_max_iter: int = 100,
+        spatial_clustering_algorithm: Literal["kmedoids", "kmeans"] = "kmedoids",
+        temporal_clustering_algorithm: Literal["kmedoids", "kmeans"] = "kmedoids",
+        objective_spatial_reconstruction: Literal["medoid", "mean"] = "medoid",
+        objective_temporal_reconstruction: Literal["medoid", "mean"] = "mean",
         random_state: int = 0,
         candidate_seed_mode: Literal["current", "full"] = "current",
         enforce_spatial_adjacency: bool = False,
@@ -1221,6 +1452,23 @@ class AlternatingSpatioTemporalReducer:
         self.standardize_day_matrix_cols = bool(standardize_day_matrix_cols)
 
         self.kmedoids_max_iter = int(kmedoids_max_iter)
+        self.spatial_clustering_algorithm = str(spatial_clustering_algorithm).lower()
+        self.temporal_clustering_algorithm = str(temporal_clustering_algorithm).lower()
+        self.objective_spatial_reconstruction = str(objective_spatial_reconstruction).lower()
+        self.objective_temporal_reconstruction = str(objective_temporal_reconstruction).lower()
+
+        valid_algorithms = {"kmedoids", "kmeans"}
+        if self.spatial_clustering_algorithm not in valid_algorithms:
+            raise ValueError("spatial_clustering_algorithm must be 'kmedoids' or 'kmeans'.")
+        if self.temporal_clustering_algorithm not in valid_algorithms:
+            raise ValueError("temporal_clustering_algorithm must be 'kmedoids' or 'kmeans'.")
+
+        valid_reconstruction = {"medoid", "mean"}
+        if self.objective_spatial_reconstruction not in valid_reconstruction:
+            raise ValueError("objective_spatial_reconstruction must be 'medoid' or 'mean'.")
+        if self.objective_temporal_reconstruction not in valid_reconstruction:
+            raise ValueError("objective_temporal_reconstruction must be 'medoid' or 'mean'.")
+
         self.random_state = int(random_state)
 
         self.enforce_spatial_adjacency = bool(enforce_spatial_adjacency)
@@ -1229,6 +1477,7 @@ class AlternatingSpatioTemporalReducer:
 
         self.feature_weights = feature_weights
         self.candidate_seed_mode = str(candidate_seed_mode)
+
     def _balanced_pair(self, N: int, D: int, budget: int) -> Tuple[int, int]:
         """Find a near-balanced integer pair (K_nodes, K_days) under the budget."""
         best_pair = (1, 1)
@@ -1287,10 +1536,47 @@ class AlternatingSpatioTemporalReducer:
         D_ts_n = normalize_distance_matrix(D_ts_raw, q=self.norm_q)
         return self.lambda_ts * D_ts_n + (1.0 - self.lambda_ts) * D_geo_n
 
+    def _build_spatial_feature_matrix(
+        self,
+        Xn: np.ndarray,
+        lat_deg: np.ndarray,
+        lon_deg: np.ndarray,
+        rep_days: np.ndarray,
+        rep_weights: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Build node feature rows for k-means spatial clustering.
+
+        The feature matrix mirrors the k-medoids distance ingredients: weighted
+        temporal features plus normalized coordinates, balanced by lambda_ts.
+        """
+        X_for_nodes = Xn[:, rep_days, :]
+        Z_ts = build_node_ts_feature_matrix(X_for_nodes, rep_weights.astype(float))
+        Z_ts = normalize_feature_columns(Z_ts)
+
+        Z_geo = np.column_stack([
+            np.asarray(lat_deg, dtype=float),
+            np.asarray(lon_deg, dtype=float),
+        ])
+        Z_geo = normalize_feature_columns(Z_geo)
+
+        blocks = []
+        if self.lambda_ts > 0.0:
+            blocks.append(np.sqrt(self.lambda_ts) * Z_ts)
+        if self.lambda_ts < 1.0:
+            blocks.append(np.sqrt(1.0 - self.lambda_ts) * Z_geo)
+
+        if not blocks:
+            return Z_ts
+
+        return np.concatenate(blocks, axis=1)
+
     def _solve_for_pair(
         self,
         Xn: np.ndarray,
         D_geo_n: np.ndarray,
+        lat_deg: np.ndarray,
+        lon_deg: np.ndarray,
         rep_days_seed: np.ndarray,
         rep_weights_seed: np.ndarray,
         K_nodes: int,
@@ -1304,13 +1590,22 @@ class AlternatingSpatioTemporalReducer:
 
         Spatial clustering is conditioned on the provided temporal seed
         (representative days and weights). Temporal clustering is then computed
-        on the medoid-based spatial representation.
+        on the spatially reconstructed system-state representation.
         """
         D_node = self._build_spatial_distance(Xn, D_geo_n, rep_days_seed, rep_weights_seed)
-        labels_nodes, rep_nodes = kmedoids_precomputed(
-            D_node,
-            K_nodes,
-            max_iter=self.kmedoids_max_iter,
+        Z_node = self._build_spatial_feature_matrix(
+            Xn,
+            lat_deg,
+            lon_deg,
+            rep_days_seed,
+            rep_weights_seed,
+        )
+        labels_nodes, rep_nodes = cluster_items(
+            algorithm=self.spatial_clustering_algorithm,
+            k=K_nodes,
+            distance_matrix=D_node,
+            feature_matrix=Z_node,
+            kmedoids_max_iter=self.kmedoids_max_iter,
             random_state=self.random_state,
         )
 
@@ -1325,21 +1620,33 @@ class AlternatingSpatioTemporalReducer:
             node_cluster_weights,
         )
 
-        X_rep_nodes = Xn[rep_nodes, :, :]
-        D_day_raw, day_pca_info = build_day_distance(
-            X_rep_nodes,
-            cluster_sizes=rep_node_weights,
+        if self.objective_spatial_reconstruction == "mean":
+            X_day_source, _ = aggregate_nodes_by_cluster(
+                Xn,
+                labels_nodes,
+                node_weights=node_cluster_weights,
+            )
+            day_cluster_weights = rep_node_weights
+        else:
+            X_day_source = Xn[rep_nodes, :, :]
+            day_cluster_weights = rep_node_weights
+
+        Z_day, day_pca_info = build_day_feature_matrix(
+            X_day_source,
+            cluster_sizes=day_cluster_weights,
             use_pca=self.use_pca_days,
             pca_n_components=self.pca_days_n_components,
             pca_random_state=self.pca_days_random_state,
             standardize_day_matrix_cols=self.standardize_day_matrix_cols,
         )
-        D_day_n = normalize_distance_matrix(D_day_raw, q=self.norm_q)
+        D_day_n = normalize_distance_matrix(pairwise_distances(Z_day, metric="euclidean"), q=self.norm_q)
 
-        labels_days, rep_days = kmedoids_precomputed(
-            D_day_n,
-            K_days,
-            max_iter=self.kmedoids_max_iter,
+        labels_days, rep_days = cluster_items(
+            algorithm=self.temporal_clustering_algorithm,
+            k=K_days,
+            distance_matrix=D_day_n,
+            feature_matrix=Z_day,
+            kmedoids_max_iter=self.kmedoids_max_iter,
             random_state=self.random_state,
         )
 
@@ -1351,11 +1658,14 @@ class AlternatingSpatioTemporalReducer:
 
         rep_weights = _cluster_sizes_from_labels(labels_days)
 
-        X_rec = reconstruct_tensor_from_medoids_temporal_mean(
+        X_rec = reconstruct_tensor(
             Xn,
             rep_nodes=rep_nodes,
             labels_nodes=labels_nodes,
+            rep_days=rep_days,
             labels_days=labels_days,
+            spatial_method=self.objective_spatial_reconstruction,
+            temporal_method=self.objective_temporal_reconstruction,
         )
         objective = weighted_reconstruction_loss(
             Xn,
@@ -1630,6 +1940,8 @@ class AlternatingSpatioTemporalReducer:
                 current_solution = self._solve_for_pair(
                     Xn,
                     D_geo_n,
+                    lat_deg,
+                    lon_deg,
                     full_rep_days_seed,
                     full_rep_weights_seed,
                     K_nodes,
@@ -1741,6 +2053,8 @@ class AlternatingSpatioTemporalReducer:
             current_solution = self._solve_for_pair(
                 Xn,
                 D_geo_n,
+                lat_deg,
+                lon_deg,
                 full_rep_days_seed,
                 full_rep_weights_seed,
                 K_nodes,
@@ -1809,6 +2123,8 @@ class AlternatingSpatioTemporalReducer:
                 cand = self._solve_for_pair(
                     Xn,
                     D_geo_n,
+                    lat_deg,
+                    lon_deg,
                     seed_days,
                     seed_weights,
                     cand_kn,
@@ -2023,6 +2339,8 @@ class AlternatingSpatioTemporalReducer:
                 cand = self._solve_for_pair(
                     Xn,
                     D_geo_n,
+                    lat_deg,
+                    lon_deg,
                     seed_days,
                     seed_weights,
                     cand_kn,

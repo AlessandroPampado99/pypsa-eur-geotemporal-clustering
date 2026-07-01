@@ -16,6 +16,7 @@ Outputs:
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +70,30 @@ def _load_summary(path: Path) -> pd.DataFrame:
 
     return df
 
+
+
+
+def _scenario_group_cols(df: pd.DataFrame) -> list[str]:
+    """Return grouping columns that keep algorithm scenarios separate when present."""
+    return ["algorithm_scenario"] if "algorithm_scenario" in df.columns else []
+
+
+def _best_run_columns(df: pd.DataFrame) -> list[str]:
+    cols = [
+        "run_id",
+        "algorithm_scenario",
+        "spatial_algorithm",
+        "temporal_algorithm",
+        "objective_spatial_reconstruction",
+        "objective_temporal_reconstruction",
+        "init_nodes",
+        "init_days",
+        "final_K_nodes",
+        "final_K_days",
+        "final_total_steps",
+        "objective",
+    ]
+    return [c for c in cols if c in df.columns]
 
 def _prepare_init_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -148,8 +173,9 @@ def plot_final_shape_scatter(df: pd.DataFrame, out_path: Path) -> None:
     """
     Scatter of final shapes: x=K_nodes, y=K_days, color=objective, size=count.
     """
+    group_cols = _scenario_group_cols(df) + ["final_K_nodes", "final_K_days", "final_total_steps"]
     grouped = (
-        df.groupby(["final_K_nodes", "final_K_days", "final_total_steps"], as_index=False)
+        df.groupby(group_cols, as_index=False)
         .agg(
             objective_best=("objective", "min"),
             objective_mean=("objective", "mean"),
@@ -182,7 +208,12 @@ def plot_final_shape_scatter(df: pd.DataFrame, out_path: Path) -> None:
     # Annotate only the best few points to avoid clutter.
     for _, row in grouped.head(12).iterrows():
         ax.annotate(
-            f"{int(row['final_K_nodes'])},{int(row['final_K_days'])}",
+            (
+                f"{row['algorithm_scenario']}\n"
+                if "algorithm_scenario" in grouped.columns
+                else ""
+            )
+            + f"{int(row['final_K_nodes'])},{int(row['final_K_days'])}",
             (row["final_K_nodes"], row["final_K_days"]),
             textcoords="offset points",
             xytext=(5, 5),
@@ -232,8 +263,9 @@ def plot_best_objective_by_final_shape(df: pd.DataFrame, out_path: Path) -> None
     """
     Bar plot of the best final shapes.
     """
+    group_cols = _scenario_group_cols(df) + ["final_K_nodes", "final_K_days"]
     grouped = (
-        df.groupby(["final_K_nodes", "final_K_days"], as_index=False)
+        df.groupby(group_cols, as_index=False)
         .agg(
             objective_best=("objective", "min"),
             objective_mean=("objective", "mean"),
@@ -249,6 +281,8 @@ def plot_best_objective_by_final_shape(df: pd.DataFrame, out_path: Path) -> None
         + "x"
         + grouped["final_K_days"].astype(int).astype(str)
     )
+    if "algorithm_scenario" in grouped.columns:
+        grouped["shape"] = grouped["algorithm_scenario"].astype(str) + " | " + grouped["shape"]
 
     fig, ax = plt.subplots(figsize=(max(9, 0.35 * len(grouped)), 5))
 
@@ -266,10 +300,25 @@ def plot_best_objective_by_final_shape(df: pd.DataFrame, out_path: Path) -> None
     plt.close(fig)
 
 
-def main() -> None:
-    _safe_mkdir(OUT_DIR)
+def generate_scan_summary_plots(
+    scan_dir: Path,
+    *,
+    out_dir: Path | None = None,
+    drop_full_baseline_from_init_plots: bool = DROP_FULL_BASELINE_FROM_INIT_PLOTS,
+    top_n_final_shapes: int = TOP_N_FINAL_SHAPES,
+) -> None:
+    global DROP_FULL_BASELINE_FROM_INIT_PLOTS, TOP_N_FINAL_SHAPES
 
-    df = _load_summary(SUMMARY_CSV)
+    DROP_FULL_BASELINE_FROM_INIT_PLOTS = bool(drop_full_baseline_from_init_plots)
+    TOP_N_FINAL_SHAPES = int(top_n_final_shapes)
+
+    scan_dir = Path(scan_dir)
+    summary_csv = scan_dir / "scan_summary.csv"
+    out_dir = Path(out_dir) if out_dir is not None else scan_dir / "plots_summary"
+
+    _safe_mkdir(out_dir)
+
+    df = _load_summary(summary_csv)
 
     print("Loaded scan summary:")
     print(f"  rows: {len(df)}")
@@ -277,20 +326,13 @@ def main() -> None:
     print()
 
     print("Best runs:")
-    cols = [
-        "run_id",
-        "init_nodes",
-        "init_days",
-        "final_K_nodes",
-        "final_K_days",
-        "final_total_steps",
-        "objective",
-    ]
+    cols = _best_run_columns(df)
     print(df.sort_values("objective")[cols].head(20).to_string(index=False))
     print()
 
+    group_cols = _scenario_group_cols(df) + ["final_K_nodes", "final_K_days", "final_total_steps"]
     shape_summary = (
-        df.groupby(["final_K_nodes", "final_K_days", "final_total_steps"], as_index=False)
+        df.groupby(group_cols, as_index=False)
         .agg(
             objective_best=("objective", "min"),
             objective_mean=("objective", "mean"),
@@ -303,35 +345,75 @@ def main() -> None:
     print("Best final shapes:")
     print(shape_summary.head(20).to_string(index=False))
 
-    shape_summary.to_csv(OUT_DIR / "final_shape_summary_from_plot_script.csv", index=False)
+    shape_summary.to_csv(out_dir / "final_shape_summary_from_plot_script.csv", index=False)
 
     plot_objective_vs_initial_nodes(
         df,
-        OUT_DIR / "objective_vs_initial_nodes.png",
+        out_dir / "objective_vs_initial_nodes.png",
     )
 
     plot_objective_vs_final_nodes(
         df,
-        OUT_DIR / "objective_vs_final_nodes.png",
+        out_dir / "objective_vs_final_nodes.png",
     )
 
     plot_final_shape_scatter(
         df,
-        OUT_DIR / "final_shape_scatter.png",
+        out_dir / "final_shape_scatter.png",
     )
 
     plot_initial_to_final_nodes(
         df,
-        OUT_DIR / "initial_to_final_nodes.png",
+        out_dir / "initial_to_final_nodes.png",
     )
 
     plot_best_objective_by_final_shape(
         df,
-        OUT_DIR / "best_objective_by_final_shape.png",
+        out_dir / "best_objective_by_final_shape.png",
     )
 
     print()
-    print(f"Plots written to: {OUT_DIR}")
+    print(f"Plots written to: {out_dir}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Plot summary diagnostics for a geo-temporal clustering scan."
+    )
+    parser.add_argument(
+        "--scan-dir",
+        type=Path,
+        default=SCAN_DIR,
+        help="Directory containing scan_summary.csv.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Plot output directory. Defaults to <scan-dir>/plots_summary.",
+    )
+    parser.add_argument(
+        "--keep-full-baseline",
+        action="store_true",
+        help="Include init_mode=full rows in initial-condition plots.",
+    )
+    parser.add_argument(
+        "--top-n-final-shapes",
+        type=int,
+        default=TOP_N_FINAL_SHAPES,
+        help="Number of final shapes shown in the bar plot.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    generate_scan_summary_plots(
+        args.scan_dir,
+        out_dir=args.out_dir,
+        drop_full_baseline_from_init_plots=not args.keep_full_baseline,
+        top_n_final_shapes=args.top_n_final_shapes,
+    )
 
 
 if __name__ == "__main__":

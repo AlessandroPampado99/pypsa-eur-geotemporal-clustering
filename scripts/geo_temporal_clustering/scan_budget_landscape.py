@@ -54,14 +54,14 @@ from scripts.geo_temporal_clustering.plot_scan_summary import generate_scan_summ
 # USER SETTINGS
 # =============================================================================
 
-NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/reference_nuts3_IT_kmeans_400/gtf-n2-d200/networks/base_s_adm_elec_Gt.nc")
+NETWORK_PATH = Path("/home/pampado/clustering/pypsa-eur/resources/reference_nuts3_ES_kmeans_400/complete/networks/base_s_adm_elec_.nc")
 
-OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_fixed_pair")
+OUT_DIR = Path("resources/geotemporal_clustering_scan/400_mean_ES")
 
 # Standalone reducer mode:
 # - "budget": reproduce the budget/local-search behaviour
 # - "fixed_pair": evaluate exactly each (K_nodes, K_days) pair
-RUN_MODE = "fixed_pair"
+RUN_MODE = "budget"
 
 # Main scan parameters
 TARGET_BUDGET = 380
@@ -132,7 +132,7 @@ SCAN_PLOTS_DIRNAME = "plots_summary"
 
 # Reducer parameters
 REDUCER_BASE_CFG = {
-    "lambda_ts": 0.15,
+    "lambda_ts": 0.10,
     "normalize": "zscore",
     "max_total_steps": TARGET_BUDGET,
     "loss_norm": "l2_squared",

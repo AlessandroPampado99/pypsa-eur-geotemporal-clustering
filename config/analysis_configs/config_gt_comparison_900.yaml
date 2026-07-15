@@ -1,7 +1,7 @@
 paths:
   root_dir: "/home/pampado/clustering/pypsa-eur"
-  runs_dir: "results/reference_nuts3_mean_900_nolineexpansion"
-  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_900_mean_nolineexpansion"
+  runs_dir: "results/reference_nuts3_IT_kmeans_900"
+  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_IT_kmeans_900"
 
 network:
   # Flexible template. Available placeholders:
@@ -50,7 +50,7 @@ clustering:
 
   # Expected clustering history path:
   # resources/reference_nuts3_mean_900_nolineexpansion/<run>/geotemporal_clustering/base_s_adm_elec_Gt/history.csv
-  resources_dir: "resources/reference_nuts3_mean_900_nolineexpansion"
+  resources_dir: "resources/reference_nuts3_IT_kmeans_900"
 
   history_filename: "history.csv"
   objective_column: "objective"

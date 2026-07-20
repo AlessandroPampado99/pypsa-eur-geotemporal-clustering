@@ -1,7 +1,7 @@
 paths:
   root_dir: "/home/pampado/clustering/pypsa-eur"
-  runs_dir: "results/reference_nuts3_IT_kmeans_1600"
-  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_IT_kmeans_1600"
+  runs_dir: "results/reference_nuts3_IT_kmeans_200"
+  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_IT_kmeans_200"
 
 network:
   # Flexible template. Available placeholders:
@@ -21,8 +21,8 @@ runs:
 
 budget_scan:
   enabled: true
-  min_total_steps: 1550
-  max_total_steps: 1650
+  min_total_steps: 190
+  max_total_steps: 210
 
 clustering:
   enabled: true
@@ -32,7 +32,7 @@ clustering:
   #   results/reference_nuts3_mean_400_noseasonal/<run>/networks/base_s_adm_elec_Gt.nc
   # Clustering history:
   #   resources/reference_nuts3_mean_400_noseasonal/<run>/geotemporal_clustering/history.csv
-  resources_dir: "resources/reference_nuts3_IT_kmeans_1600"
+  resources_dir: "resources/reference_nuts3_IT_kmeans_200"
 
   history_filename: "history.csv"
   objective_column: "objective"

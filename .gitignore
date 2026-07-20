@@ -35,6 +35,7 @@ _build
 /config/create_scenarios.py
 
 screenlog*
+local
 
 config/config.yaml
 config/scenarios.yaml

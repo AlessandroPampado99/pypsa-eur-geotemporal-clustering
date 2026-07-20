@@ -20,11 +20,11 @@ remote:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: "clustering_new_algorithm_tuning"
+  prefix: "reference_nuts3_IT_kmeans_400"
   name: all
   scenarios:
     enable: true
-    file: config/clustering_matteo/scenarios_new_tuning.yaml
+    file: config/clustering_validation/scenarios_validation_400.yaml
   disable_progressbar: false
   shared_resources:
     policy: false
@@ -140,7 +140,7 @@ electricity:
   autarky:
     enable: false
     by_country: false
-  transmission_limit: vopt
+  transmission_limit: v0
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#atlite
 atlite:
@@ -1085,7 +1085,11 @@ clustering:
 
   geotemporal:
     seasonal_storage:
+      enable: true
       cyclic: true
+
+    temporal:
+      representation: "mean"
 
     buses:
       mode: "loads"
@@ -1094,7 +1098,7 @@ clustering:
     features:
       hours_per_day: 24
       feature_mode: "daily_stats"
-      stats: ["mean", "max", "min", "std", "ramp_max", "energy"]
+      stats: ["mean", "max", "std", "ramp_max"]
       include:
         load: true
         pv_cf:
@@ -1106,27 +1110,24 @@ clustering:
 
     objective:
       feature_weights:
-        load: 1.0
+        load: 2.0
         pv_cf: 1.0
         wind_cf: 1.0
-      node_weights: "mean_load"   # "mean_load", "peak_load", or "none"
+      node_weights: "electric_demand"   # "mean_load", "peak_load", or "none"
       reconstruction:
-        # Objective tensor reconstruction. Use "medoid", "mean",
-        # "clustering" (kmedoids -> medoid, kmeans -> mean),
-        # or "reconstruction" (match network reconstruction setting).
-        spatial: "medoid"
-        temporal: "mean"
+        spatial: "clustering"
+        temporal: "clustering"
 
     reducer:
-      reduction_mode: "budget"  # "budget" or "fixed_pair"
+      reduction_mode: "fixed_pair"  # "budget" or "fixed_pair"
       fixed_nodes: 30
       fixed_days: 20
 
       algorithms:
-        spatial: "kmedoids"   # "kmedoids" or "kmeans"
-        temporal: "kmedoids"  # "kmedoids" or "kmeans"
+        spatial: "kmeans"
+        temporal: "kmeans"
 
-      lambda_ts: 0.5
+      lambda_ts: 0.15
       normalize: "zscore"
       max_total_steps: 900
       init_mode: "balanced"       # "balanced" or "full" balanced -> nearly sqrt total; full from total

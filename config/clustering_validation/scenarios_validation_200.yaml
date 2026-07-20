@@ -1,0 +1,195 @@
+# ---------------------------------------------------------------------------
+# Fixed-pair geo-temporal scan:
+# 190 <= fixed_nodes * fixed_days <= 210
+# Prefer pairs close to 200 where integer constraints allow it.
+# Pairs with no integer fixed_days in this range are skipped.
+# ---------------------------------------------------------------------------
+
+gtf-n2-d100:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 2
+        fixed_days: 100
+        max_total_steps: 200
+
+gtf-n3-d67:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 3
+        fixed_days: 67
+        max_total_steps: 201
+
+gtf-n4-d50:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 4
+        fixed_days: 50
+        max_total_steps: 200
+
+gtf-n5-d40:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 5
+        fixed_days: 40
+        max_total_steps: 200
+
+gtf-n6-d33:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 6
+        fixed_days: 33
+        max_total_steps: 198
+
+gtf-n7-d29:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 7
+        fixed_days: 29
+        max_total_steps: 203
+
+gtf-n8-d25:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 8
+        fixed_days: 25
+        max_total_steps: 200
+
+gtf-n10-d20:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 10
+        fixed_days: 20
+        max_total_steps: 200
+
+gtf-n12-d17:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 12
+        fixed_days: 17
+        max_total_steps: 204
+
+gtf-n13-d15:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 13
+        fixed_days: 15
+        max_total_steps: 195
+
+gtf-n16-d13:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 16
+        fixed_days: 13
+        max_total_steps: 208
+
+gtf-n18-d11:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 18
+        fixed_days: 11
+        max_total_steps: 198
+
+gtf-n20-d10:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 20
+        fixed_days: 10
+        max_total_steps: 200
+
+gtf-n22-d9:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 22
+        fixed_days: 9
+        max_total_steps: 198
+
+gtf-n25-d8:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 25
+        fixed_days: 8
+        max_total_steps: 200
+
+gtf-n28-d7:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 28
+        fixed_days: 7
+        max_total_steps: 196
+
+gtf-n33-d6:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 33
+        fixed_days: 6
+        max_total_steps: 198
+
+gtf-n40-d5:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 40
+        fixed_days: 5
+        max_total_steps: 200
+
+gtf-n50-d4:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 50
+        fixed_days: 4
+        max_total_steps: 200
+
+gtf-n67-d3:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 67
+        fixed_days: 3
+        max_total_steps: 201
+
+gtf-n96-d2:
+  clustering:
+    geotemporal:
+      reducer:
+        reduction_mode: "fixed_pair"
+        fixed_nodes: 96
+        fixed_days: 2
+        max_total_steps: 192

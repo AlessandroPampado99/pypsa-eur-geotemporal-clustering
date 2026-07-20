@@ -419,6 +419,24 @@ def collect_metrics_for_network(
                 components=excluded_components,
             )
 
+            if set(excluded_components) == {"Line"}:
+                line_costs = corrected
+            else:
+                line_costs = compute_objective_without_component_costs(
+                    n=n,
+                    components=["Line"],
+                )
+
+            line_total_cost = line_costs["removed_component_total_cost"]
+            objective = summary["objective"]
+
+            summary["line_capex"] = line_costs["removed_component_capex"]
+            summary["line_opex"] = line_costs["removed_component_opex"]
+            summary["line_total_cost"] = line_total_cost
+            summary["line_cost_percentage_of_total"] = (
+                100.0 * line_total_cost / objective if objective != 0.0 else np.nan
+            )
+
             summary["line_excluded_capex"] = corrected["removed_component_capex"]
             summary["line_excluded_opex"] = corrected["removed_component_opex"]
             summary["line_excluded_total_cost"] = corrected["removed_component_total_cost"]

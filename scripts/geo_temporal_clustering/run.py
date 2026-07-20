@@ -39,6 +39,7 @@ from scripts.geo_temporal_clustering.core import (
     cf_by_bus_timeseries,
     build_full_busmap,
     apply_temporal_reduction,
+    representative_method_from_algorithm,
 )
 
 from scripts.geo_temporal_clustering.spatial_reconstruction import (
@@ -65,6 +66,60 @@ def _smk_path(namedlist: Any, key: str, idx: int = 0) -> str:
         return str(namedlist[idx])
 
 
+
+
+
+def _temporal_representation_to_objective_method(representation: str) -> str:
+    """Map network temporal representation to tensor reconstruction method."""
+    representation = str(representation).lower()
+    if representation == "mean":
+        return "mean"
+    if representation in {"medoid", "medoid_scaled"}:
+        return "medoid"
+    raise ValueError("temporal representation must be one of: medoid, mean, medoid_scaled.")
+
+
+def _resolve_objective_reconstruction_method(
+    value: Any,
+    *,
+    clustering_algorithm: str,
+    reconstruction_method: str,
+    default: str,
+    name: str,
+) -> str:
+    """
+    Resolve objective reconstruction config.
+
+    Accepted values:
+    - "medoid" or "mean": explicit objective reconstruction method.
+    - "clustering": derive from clustering algorithm
+      (kmedoids -> medoid, kmeans -> mean).
+    - "reconstruction": use the configured network reconstruction method.
+    """
+    if value is None:
+        value = default
+
+    value = str(value).lower()
+
+    if value in {"medoid", "mean"}:
+        return value
+
+    if value in {"clustering", "algorithm"}:
+        return representative_method_from_algorithm(clustering_algorithm)
+
+    if value == "reconstruction":
+        reconstruction_method = str(reconstruction_method).lower()
+        if reconstruction_method not in {"medoid", "mean"}:
+            raise ValueError(
+                f"Cannot use reconstruction method {reconstruction_method!r} "
+                f"for objective {name}; expected 'medoid' or 'mean'."
+            )
+        return reconstruction_method
+
+    raise ValueError(
+        f"Unsupported objective reconstruction setting for {name}: {value!r}. "
+        "Use 'medoid', 'mean', 'clustering', or 'reconstruction'."
+    )
 
 def _build_feature_weights(feature_names, cfg_weights):
     """
@@ -124,11 +179,27 @@ def main() -> None:
     pv_cfg = _cfg_get(include, "pv_cf", {"carrier": "solar", "weight_by": "p_nom"}) or {}
     wind_cfg = _cfg_get(include, "wind_cf", {"carrier": "onwind", "weight_by": "p_nom"}) or {}
 
-    feature_weights_cfg = _cfg_get(_cfg_get(cfg, "objective", {}), "feature_weights", {}) or {}
-    node_weights_cfg = _cfg_get(_cfg_get(cfg, "objective", {}), "node_weights", None)
+    objective_cfg = _cfg_get(cfg, "objective", {}) or {}
+    feature_weights_cfg = _cfg_get(objective_cfg, "feature_weights", {}) or {}
+    node_weights_cfg = _cfg_get(objective_cfg, "node_weights", None)
 
     # Reducer params
     r_cfg = _cfg_get(cfg, "reducer", {}) or {}
+    algorithms_cfg = _cfg_get(r_cfg, "algorithms", {}) or {}
+    spatial_algorithm = str(
+        _cfg_get(
+            algorithms_cfg,
+            "spatial",
+            _cfg_get(r_cfg, "spatial_algorithm", _cfg_get(r_cfg, "algorithm", "kmedoids")),
+        )
+    ).lower()
+    temporal_algorithm = str(
+        _cfg_get(
+            algorithms_cfg,
+            "temporal",
+            _cfg_get(r_cfg, "temporal_algorithm", _cfg_get(r_cfg, "algorithm", "kmedoids")),
+        )
+    ).lower()
 
     enforce_spatial_adjacency = bool(_cfg_get(r_cfg, "enforce_spatial_adjacency", False))
     region_name_col = str(_cfg_get(r_cfg, "region_name_col", "name"))
@@ -238,7 +309,40 @@ def main() -> None:
             )
         
     temporal_cfg = _cfg_get(cfg, "temporal", {}) or {}
-    temporal_representation = str(_cfg_get(temporal_cfg, "representation", "medoid"))
+    temporal_representation = str(_cfg_get(temporal_cfg, "representation", "medoid")).lower()
+
+    reconstruction_cfg = _cfg_get(cfg, "reconstruction", {}) or {}
+    spatial_reconstruction_method = str(
+        _cfg_get(reconstruction_cfg, "spatial", "medoid")
+    ).lower()
+    temporal_reconstruction_method = _temporal_representation_to_objective_method(
+        temporal_representation
+    )
+
+    objective_reconstruction_cfg = _cfg_get(objective_cfg, "reconstruction", {}) or {}
+    objective_spatial_reconstruction = _resolve_objective_reconstruction_method(
+        _cfg_get(objective_reconstruction_cfg, "spatial", None),
+        clustering_algorithm=spatial_algorithm,
+        reconstruction_method=spatial_reconstruction_method,
+        default="medoid",
+        name="spatial",
+    )
+    objective_temporal_reconstruction = _resolve_objective_reconstruction_method(
+        _cfg_get(objective_reconstruction_cfg, "temporal", None),
+        clustering_algorithm=temporal_algorithm,
+        reconstruction_method=temporal_reconstruction_method,
+        default="mean",
+        name="temporal",
+    )
+
+    logger.info(
+        "GT algorithms: spatial=%s, temporal=%s; objective reconstruction: spatial=%s, temporal=%s; network temporal representation=%s.",
+        spatial_algorithm,
+        temporal_algorithm,
+        objective_spatial_reconstruction,
+        objective_temporal_reconstruction,
+        temporal_representation,
+    )
 
     reducer = AlternatingSpatioTemporalReducer(
         reduction_mode=str(_cfg_get(r_cfg, "reduction_mode", "budget")),
@@ -266,6 +370,10 @@ def main() -> None:
             _cfg_get(_cfg_get(r_cfg, "pca_days", {}), "standardize_day_matrix_cols", False)
         ),
         kmedoids_max_iter=int(_cfg_get(r_cfg, "kmedoids_max_iter", 100)),
+        spatial_clustering_algorithm=spatial_algorithm,
+        temporal_clustering_algorithm=temporal_algorithm,
+        objective_spatial_reconstruction=objective_spatial_reconstruction,
+        objective_temporal_reconstruction=objective_temporal_reconstruction,
         random_state=int(_cfg_get(r_cfg, "random_state", 0)),
         enforce_spatial_adjacency=enforce_spatial_adjacency,
         regions_gdf=regions_gdf,
@@ -434,6 +542,11 @@ def main() -> None:
         "max_total_steps": int(_cfg_get(r_cfg, "max_total_steps", 144)),
         "actual_total_steps": int(len(np.unique(result.labels_nodes)) * len(np.unique(result.labels_days))),
         "objective": float(result.objective),
+        "spatial_clustering_algorithm": spatial_algorithm,
+        "temporal_clustering_algorithm": temporal_algorithm,
+        "objective_spatial_reconstruction": objective_spatial_reconstruction,
+        "objective_temporal_reconstruction": objective_temporal_reconstruction,
+        "temporal_representation": temporal_representation,
         "feature_names": feat_names,
         "feature_weights": feature_weights.tolist(),
         "spatial_adjacency_enabled": bool(enforce_spatial_adjacency),

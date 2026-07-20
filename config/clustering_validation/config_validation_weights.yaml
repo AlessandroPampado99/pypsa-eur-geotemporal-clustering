@@ -1114,11 +1114,21 @@ clustering:
         pv_cf: 1.0
         wind_cf: 1.0
       node_weights: "electric_demand"   # "mean_load", "peak_load", or "none"
+      reconstruction:
+        # Objective tensor reconstruction. Use "medoid", "mean",
+        # "clustering" (kmedoids -> medoid, kmeans -> mean),
+        # or "reconstruction" (match network reconstruction setting).
+        spatial: "medoid"
+        temporal: "mean"
 
     reducer:
       reduction_mode: "fixed_pair"  # "budget" or "fixed_pair"
       fixed_nodes: 30
       fixed_days: 20
+
+      algorithms:
+        spatial: "kmedoids"   # "kmedoids" or "kmeans"
+        temporal: "kmedoids"  # "kmedoids" or "kmeans"
 
       lambda_ts: 0.05
       normalize: "zscore"

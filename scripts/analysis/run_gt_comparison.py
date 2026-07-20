@@ -66,7 +66,26 @@ def write_outputs(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    line_cost_columns = [
+        "run",
+        "n_nodes",
+        "n_days",
+        "total_steps",
+        "scan_type",
+        "objective",
+        "line_capex",
+        "line_opex",
+        "line_total_cost",
+        "line_cost_percentage_of_total",
+        "objective_without_line_cost",
+    ]
+    available_line_cost_columns = [
+        column for column in line_cost_columns if column in metrics_summary.columns
+    ]
+    line_cost_summary = metrics_summary.loc[:, available_line_cost_columns].copy()
+
     metrics_summary.to_csv(output_dir / "metrics_summary.csv", index=False)
+    line_cost_summary.to_csv(output_dir / "line_cost_summary.csv", index=False)
     generation_by_carrier.to_csv(output_dir / "generation_by_carrier.csv", index=False)
     capacity_by_component_carrier.to_csv(
         output_dir / "capacity_by_component_carrier.csv", index=False
@@ -76,6 +95,7 @@ def write_outputs(
     xlsx_path = output_dir / "gt_comparison_summary.xlsx"
     with pd.ExcelWriter(xlsx_path) as writer:
         metrics_summary.to_excel(writer, sheet_name="metrics_summary", index=False)
+        line_cost_summary.to_excel(writer, sheet_name="line_cost_summary", index=False)
         generation_by_carrier.to_excel(writer, sheet_name="generation_by_carrier", index=False)
         capacity_by_component_carrier.to_excel(
             writer, sheet_name="capacity_by_component_carrier", index=False

@@ -1,0 +1,192 @@
+paths:
+  root_dir: "/home/pampado/clustering/pypsa-eur"
+  runs_dir: "results/reference_nuts3_mean_400_nolineexpansion_convergence"
+  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison_400_mean_nolineexpansion_convergence"
+
+network:
+  # Flexible template. Available placeholders:
+  # {root_dir}, {runs_dir}, {run}, {filename}
+  filename: "base_s_adm_elec_Gt.nc"
+  path_template: "{root_dir}/{runs_dir}/{run}/networks/{filename}"
+
+reference:
+  run: "complete"
+  n_nodes: 96
+  n_days: 365
+
+runs:
+  auto_discover: true
+  include: []
+  exclude: []
+
+budget_scan:
+  enabled: true
+  min_total_steps: 380
+  max_total_steps: 420
+
+clustering:
+  enabled: true
+
+  # Analogous path to results/, but under resources/.
+  # Network:
+  #   results/reference_nuts3_mean_400_noseasonal/<run>/networks/base_s_adm_elec_Gt.nc
+  # Clustering history:
+  #   resources/reference_nuts3_mean_400_noseasonal/<run>/geotemporal_clustering/history.csv
+  resources_dir: "resources/reference_nuts3_mean_400_nolineexpansion_convergence"
+
+  history_filename: "history.csv"
+  objective_column: "objective"
+
+  # Available placeholders:
+  # {root_dir}, {resources_dir}, {run}, {history_filename}
+  history_path_template: "{root_dir}/{resources_dir}/{run}/geotemporal_clustering/base_s_adm_elec_Gt/{history_filename}"
+
+carriers:
+  conventional:
+    - nuclear
+    - oil
+    - OCGT
+    - CCGT
+    - coal
+    - lignite
+    - geothermal
+    - biomass
+
+  renewable:
+    - solar
+    - solar-hsat
+    - onwind
+    - offwind-ac
+    - offwind-dc
+    - offwind-float
+    - hydro
+
+metrics:
+  objective: true
+  demand: true
+  generation: true
+  capacities: true
+
+weights:
+  # For reconstructed full-year networks, "objective" is often safer if it
+  # contains the correct temporal weights after representative-day expansion.
+  energy_weight_column: "objective"
+
+capacity:
+  components:
+    Generator:
+      enabled: true
+      attribute: "p_nom_opt"
+      fallback_attribute: "p_nom"
+
+    Link:
+      enabled: true
+      attribute: "p_nom_opt"
+      fallback_attribute: "p_nom"
+
+    Store:
+      enabled: true
+      attribute: "e_nom_opt"
+      fallback_attribute: "e_nom"
+
+    StorageUnit:
+      enabled: true
+      attribute: "p_nom_opt"
+      fallback_attribute: "p_nom"
+
+    Line:
+      enabled: true
+      attribute: "s_nom_opt"
+      fallback_attribute: "s_nom"
+
+objective_correction:
+  enabled: true
+
+  # Components whose capex + opex should be removed from the optimization objective.
+  # Default is only Line. Add Transformer if needed.
+  # Be careful with Link: in PyPSA-Eur it also includes converters, electrolysers, etc.
+  exclude_components:
+    - Line
+
+plots:
+  enabled: true
+  dpi: 300
+  formats:
+    - png
+    - pdf
+
+  make_2d: true
+
+  # I would keep this false: matplotlib 3D is visually misleading here.
+  make_3d: false
+
+  # Additional plots.
+  make_budget_combined: true
+  make_objective_comparison: true
+  make_objective_without_line_cost_comparison: true
+
+  # Possible values: absolute, delta, relative_delta
+  plot_values:
+    - absolute
+    - relative_delta
+
+  # Metrics available in metrics_summary.csv.
+  metrics:
+    - objective
+    - renewable_generation
+    - conventional_generation
+    - total_demand
+    - renewable_capacity
+    - conventional_capacity
+    - store_energy_capacity
+    - storage_unit_power_capacity
+    - link_power_capacity
+    - line_capacity
+
+
+  # Combined percentage plot along budget_scan.
+  # All these are plotted as *_relative_delta [%].
+  budget_combined_profiles:
+    - metric: conventional_generation
+      label: "Conventional generation"
+
+    - metric: renewable_capacity
+      label: "Renewable capacity"
+
+    - metric: store_energy_capacity
+      label: "Store capacity"
+
+    - metric: objective
+      label: "Objective function"
+
+    - metric: renewable_generation
+      label: "Renewable generation"
+
+    - metric: link_power_capacity
+      label: "Link capacity"
+
+  capacity_heatmaps:
+    enabled: true
+    value: "relative_delta"
+
+    components:
+      - Generator
+      - Link
+      - Store
+      - StorageUnit
+      - Line
+
+    # Empty list means "plot all carriers found".
+    # Otherwise only selected carriers are plotted.
+    generator_carriers:
+      - solar
+      - solar-hsat
+      - onwind
+      - offwind-ac
+      - offwind-dc
+      - offwind-float
+      - hydro
+      - nuclear
+      - OCGT
+      - CCGT
+      - biomass

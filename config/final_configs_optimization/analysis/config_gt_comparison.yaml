@@ -1,0 +1,148 @@
+paths:
+  root_dir: "/home/pampado/clustering/pypsa-eur"
+  runs_dir: "results/reference_nuts3"
+  output_dir: "results/reference_nuts3/analysis/geotemporal_comparison"
+
+network:
+  # Flexible template. Available placeholders:
+  # {root_dir}, {runs_dir}, {run}, {filename}
+  filename: "base_s_adm_elec_Gt.nc"
+  path_template: "{root_dir}/{runs_dir}/{run}/networks/{filename}"
+
+reference:
+  run: "complete"
+  n_nodes: 96
+  n_days: 365
+
+runs:
+  auto_discover: false
+  include:
+    - complete
+    - gtf-n2-d365
+    - gtf-n10-d365
+    - gtf-n20-d365
+    - gtf-n30-d365
+    - gtf-n40-d365
+    - gtf-n50-d365
+    - gtf-n60-d365
+    - gtf-n70-d365
+    - gtf-n80-d365
+    - gtf-n90-d365
+    - gtf-n96-d20
+    - gtf-n96-d40
+    - gtf-n96-d80
+    - gtf-n96-d120
+    - gtf-n96-d160
+    - gtf-n96-d200
+    - gtf-n96-d240
+    - gtf-n96-d280
+    - gtf-n96-d320
+    - gtf-n96-d360
+  exclude: []
+
+carriers:
+  conventional:
+    - nuclear
+    - oil
+    - OCGT
+    - CCGT
+    - coal
+    - lignite
+    - geothermal
+    - biomass
+
+  renewable:
+    - solar
+    - solar-hsat
+    - onwind
+    - offwind-ac
+    - offwind-dc
+    - offwind-float
+    - hydro
+
+metrics:
+  objective: true
+  demand: true
+  generation: true
+  capacities: true
+
+weights:
+  # Usually "generators" is the right choice for energy quantities.
+  # Alternatives in PyPSA can be "objective" or "stores", depending on the workflow.
+  energy_weight_column: "objective"
+
+capacity:
+  components:
+    Generator:
+      enabled: true
+      attribute: "p_nom_opt"
+      fallback_attribute: "p_nom"
+    Link:
+      enabled: true
+      attribute: "p_nom_opt"
+      fallback_attribute: "p_nom"
+    Store:
+      enabled: true
+      attribute: "e_nom_opt"
+      fallback_attribute: "e_nom"
+    StorageUnit:
+      enabled: true
+      attribute: "p_nom_opt"
+      fallback_attribute: "p_nom"
+    Line:
+      enabled: true
+      attribute: "s_nom_opt"
+      fallback_attribute: "s_nom"
+
+plots:
+  enabled: true
+  dpi: 300
+  formats:
+    - png
+    - pdf
+
+  make_2d: true
+  make_3d: true
+
+  # Possible values: absolute, delta, relative_delta
+  plot_values:
+    - absolute
+    - relative_delta
+
+  # Metrics available in metrics_summary.csv
+  metrics:
+    - objective
+    - renewable_generation
+    - conventional_generation
+    - total_demand
+    - renewable_capacity
+    - conventional_capacity
+    - store_energy_capacity
+    - storage_unit_power_capacity
+    - link_power_capacity
+    - line_capacity
+
+  capacity_heatmaps:
+    enabled: true
+    value: "relative_delta"
+    components:
+      - Generator
+      - Link
+      - Store
+      - StorageUnit
+      - Line
+
+    # Empty list means "plot all carriers found".
+    # Otherwise only selected carriers are plotted.
+    generator_carriers:
+      - solar
+      - solar-hsat
+      - onwind
+      - offwind-ac
+      - offwind-dc
+      - offwind-float
+      - hydro
+      - nuclear
+      - OCGT
+      - CCGT
+      - biomass

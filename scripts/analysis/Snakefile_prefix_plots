@@ -1,0 +1,59 @@
+"""Generate energy-balance and optimal-capacity plots for selected prefixes."""
+
+PREFIXES = [
+    "IT_200",
+    "IT_400",
+    "IT_900",
+    "IT_1600",
+    "DE_400",
+    "DE_900",
+    "ES_400",
+]
+
+
+rule all:
+    input:
+        expand("results/{prefix}/electricity_energy_balance.png", prefix=PREFIXES),
+        expand("results/{prefix}/electricity_energy_balance.csv", prefix=PREFIXES),
+        expand("results/{prefix}/optimal_capacities.png", prefix=PREFIXES),
+        expand("results/{prefix}/optimal_capacities.csv", prefix=PREFIXES),
+        expand(
+            "results/{prefix}/optimal_capacities_without_lines.png", prefix=PREFIXES
+        ),
+        expand(
+            "results/{prefix}/optimal_capacities_without_lines.csv", prefix=PREFIXES
+        ),
+
+
+rule plot_energy_balance:
+    input:
+        script="scripts/analysis/plot_prefix_energy_balance.py",
+        helpers="scripts/_helpers.py",
+        plotting_config="config/plotting.default.yaml",
+    output:
+        figure="results/{prefix}/electricity_energy_balance.png",
+        data="results/{prefix}/electricity_energy_balance.csv",
+    wildcard_constraints:
+        prefix="|".join(PREFIXES),
+    shell:
+        "python {input.script} {wildcards.prefix} "
+        "--plotting-config {input.plotting_config} --output {output.figure}"
+
+
+rule plot_optimal_capacities:
+    input:
+        script="scripts/analysis/plot_prefix_optimal_capacities.py",
+        helpers="scripts/_helpers.py",
+        plotting_config="config/plotting.default.yaml",
+    output:
+        figure="results/{prefix}/optimal_capacities.png",
+        data="results/{prefix}/optimal_capacities.csv",
+        figure_without_lines=(
+            "results/{prefix}/optimal_capacities_without_lines.png"
+        ),
+        data_without_lines="results/{prefix}/optimal_capacities_without_lines.csv",
+    wildcard_constraints:
+        prefix="|".join(PREFIXES),
+    shell:
+        "python {input.script} {wildcards.prefix} "
+        "--plotting-config {input.plotting_config} --output {output.figure}"

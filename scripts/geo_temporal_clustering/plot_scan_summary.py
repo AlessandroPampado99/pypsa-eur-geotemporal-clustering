@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 
 
 # =========================
@@ -43,6 +44,14 @@ DROP_FULL_BASELINE_FROM_INIT_PLOTS = True
 TOP_N_FINAL_SHAPES = 30
 
 PLOT_DPI = 240
+
+# Shared colour scales for plots where nodes/days are represented by colour.
+# Set either tuple to (minimum, maximum), e.g. (5, 50). Leave it as None to
+# derive one shared range from all initial and final values in scan_summary.csv.
+NODE_COLOR_RANGE: tuple[float, float] | None = None
+DAY_COLOR_RANGE: tuple[float, float] | None = None
+
+COUNT_COLORMAP = "viridis"
 
 
 # =========================
@@ -74,6 +83,27 @@ def _load_summary(path: Path) -> pd.DataFrame:
         raise KeyError(f"Missing required columns in {path}: {missing}")
 
     return df
+
+
+def _shared_color_norm(
+    df: pd.DataFrame,
+    initial_col: str,
+    final_col: str,
+    configured_range: tuple[float, float] | None,
+) -> Normalize:
+    """Build one normalization shared by initial and final count plots."""
+    if configured_range is None:
+        values = pd.concat([df[initial_col], df[final_col]], ignore_index=True).dropna()
+        vmin, vmax = float(values.min()), float(values.max())
+    else:
+        vmin, vmax = map(float, configured_range)
+
+    if not np.isfinite([vmin, vmax]).all() or vmax <= vmin:
+        raise ValueError(
+            f"Colour range must contain finite MIN MAX values with MAX > MIN; "
+            f"got ({vmin}, {vmax})."
+        )
+    return Normalize(vmin=vmin, vmax=vmax, clip=True)
 
 
 def _scenario_group_cols(df: pd.DataFrame) -> list[str]:
@@ -160,6 +190,7 @@ def _scatter_objective(
     colorbar_label: str,
     title: str,
     out_path: Path,
+    color_norm: Normalize,
 ) -> None:
     d = df.copy()
     if d.empty:
@@ -174,6 +205,8 @@ def _scatter_objective(
         s=52,
         alpha=0.82,
         c=d[color_col],
+        cmap=COUNT_COLORMAP,
+        norm=color_norm,
         edgecolors="white",
         linewidths=0.35,
     )
@@ -241,7 +274,9 @@ def _initial_to_final(
 # Plot functions
 # =========================
 
-def plot_objective_vs_initial_nodes(df: pd.DataFrame, out_path: Path) -> None:
+def plot_objective_vs_initial_nodes(
+    df: pd.DataFrame, out_path: Path, day_color_norm: Normalize
+) -> None:
     """Plot final objective as function of initial nodes."""
     _scatter_objective(
         _prepare_init_df(df),
@@ -251,10 +286,13 @@ def plot_objective_vs_initial_nodes(df: pd.DataFrame, out_path: Path) -> None:
         colorbar_label="Initial days",
         title="Final objective vs initial nodes",
         out_path=out_path,
+        color_norm=day_color_norm,
     )
 
 
-def plot_objective_vs_initial_days(df: pd.DataFrame, out_path: Path) -> None:
+def plot_objective_vs_initial_days(
+    df: pd.DataFrame, out_path: Path, node_color_norm: Normalize
+) -> None:
     """Plot final objective as function of initial days."""
     _scatter_objective(
         _prepare_init_df(df),
@@ -264,10 +302,13 @@ def plot_objective_vs_initial_days(df: pd.DataFrame, out_path: Path) -> None:
         colorbar_label="Initial nodes",
         title="Final objective vs initial days",
         out_path=out_path,
+        color_norm=node_color_norm,
     )
 
 
-def plot_objective_vs_final_nodes(df: pd.DataFrame, out_path: Path) -> None:
+def plot_objective_vs_final_nodes(
+    df: pd.DataFrame, out_path: Path, day_color_norm: Normalize
+) -> None:
     """Plot final objective as function of final nodes."""
     _scatter_objective(
         df,
@@ -277,10 +318,13 @@ def plot_objective_vs_final_nodes(df: pd.DataFrame, out_path: Path) -> None:
         colorbar_label="Final days",
         title="Final objective vs final nodes",
         out_path=out_path,
+        color_norm=day_color_norm,
     )
 
 
-def plot_objective_vs_final_days(df: pd.DataFrame, out_path: Path) -> None:
+def plot_objective_vs_final_days(
+    df: pd.DataFrame, out_path: Path, node_color_norm: Normalize
+) -> None:
     """Plot final objective as function of final days."""
     _scatter_objective(
         df,
@@ -290,6 +334,7 @@ def plot_objective_vs_final_days(df: pd.DataFrame, out_path: Path) -> None:
         colorbar_label="Final nodes",
         title="Final objective vs final days",
         out_path=out_path,
+        color_norm=node_color_norm,
     )
 
 
@@ -456,6 +501,8 @@ def generate_scan_summary_plots(
     out_dir: Path | None = None,
     drop_full_baseline_from_init_plots: bool = DROP_FULL_BASELINE_FROM_INIT_PLOTS,
     top_n_final_shapes: int = TOP_N_FINAL_SHAPES,
+    node_color_range: tuple[float, float] | None = NODE_COLOR_RANGE,
+    day_color_range: tuple[float, float] | None = DAY_COLOR_RANGE,
 ) -> None:
     global DROP_FULL_BASELINE_FROM_INIT_PLOTS, TOP_N_FINAL_SHAPES
 
@@ -469,6 +516,12 @@ def generate_scan_summary_plots(
     _safe_mkdir(out_dir)
 
     df = _load_summary(summary_csv)
+    node_color_norm = _shared_color_norm(
+        df, "init_nodes", "final_K_nodes", node_color_range
+    )
+    day_color_norm = _shared_color_norm(
+        df, "init_days", "final_K_days", day_color_range
+    )
 
     print("Loaded scan summary:")
     print(f"  rows: {len(df)}")
@@ -504,18 +557,22 @@ def generate_scan_summary_plots(
     plot_objective_vs_initial_nodes(
         df,
         out_dir / "objective_vs_initial_nodes.png",
+        day_color_norm,
     )
     plot_objective_vs_initial_days(
         df,
         out_dir / "objective_vs_initial_days.png",
+        node_color_norm,
     )
     plot_objective_vs_final_nodes(
         df,
         out_dir / "objective_vs_final_nodes.png",
+        day_color_norm,
     )
     plot_objective_vs_final_days(
         df,
         out_dir / "objective_vs_final_days.png",
+        node_color_norm,
     )
     plot_final_shape_scatter(
         df,
@@ -569,6 +626,22 @@ def parse_args() -> argparse.Namespace:
         default=TOP_N_FINAL_SHAPES,
         help="Number of final shapes shown in the bar plot.",
     )
+    parser.add_argument(
+        "--node-color-range",
+        type=float,
+        nargs=2,
+        metavar=("MIN", "MAX"),
+        default=NODE_COLOR_RANGE,
+        help="Shared node colour range. Default: infer from initial and final nodes.",
+    )
+    parser.add_argument(
+        "--day-color-range",
+        type=float,
+        nargs=2,
+        metavar=("MIN", "MAX"),
+        default=DAY_COLOR_RANGE,
+        help="Shared day colour range. Default: infer from initial and final days.",
+    )
     return parser.parse_args()
 
 
@@ -579,6 +652,8 @@ def main() -> None:
         out_dir=args.out_dir,
         drop_full_baseline_from_init_plots=not args.keep_full_baseline,
         top_n_final_shapes=args.top_n_final_shapes,
+        node_color_range=args.node_color_range,
+        day_color_range=args.day_color_range,
     )
 
 

@@ -24,7 +24,7 @@ run:
   name: all
   scenarios:
     enable: true
-    file: config/clustering_validation/scenarios_validation_400.yaml
+    file: config/clustering_validation/scenarios_validation_200.yaml
   disable_progressbar: false
   shared_resources:
     policy: false
